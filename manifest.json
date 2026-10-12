@@ -1,0 +1,10 @@
+{
+  "type": "preload-native",
+  "name": "No Updates",
+  "author": "you",
+  "version": "0.1.0",
+  "entry": "libno_updates.so",
+  "minecraft_versions": [],
+  "overwrite_files": [],
+  "overwrite_folders": []
+}
