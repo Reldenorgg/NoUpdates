@@ -86,6 +86,51 @@ std::array<void *, sizeof...(I)> makeDetours(std::index_sequence<I...>) {
   return {reinterpret_cast<void *>(&detour<I>)...};
 }
 
+// ---- Plant lab: candidate virtuals of DoublePlantBaseBlock ----
+struct Lab {
+  uintptr_t rva;
+  const char *hex; // first 16 bytes expected at rva
+  const char *name;
+};
+constexpr Lab kLab[] = {
+    {0x100d2f68, "ff0302d1fd7b04a9f85f05a9f65706a9", "Plant test 1"},
+    {0x100d2cf4, "ff8301d1fd7b03a9f52300f9f44f05a9", "Plant test 2"},
+    {0x100d2bc0, "ffc301d1fd7b03a9f72300f9f65705a9", "Plant test 3"},
+    {0x100d2d94, "ffc301d1fd7b03a9f85f04a9f65705a9", "Plant test 4"},
+    {0x100d332c, "fd7bbea9f44f01a9fd030091280040f9", "Plant test 5"},
+    {0x100d342c, "fd7bbda9f50b00f9f44f02a9fd030091", "Plant test 6"},
+    {0x100d320c, "ff8303d1fd7b0ba9f6570ca9f44f0da9", "Plant test 7"},
+};
+constexpr size_t kLabCount = sizeof(kLab) / sizeof(kLab[0]);
+constexpr const char *kLabIds[kLabCount] = {
+    "no_updates.lab1", "no_updates.lab2", "no_updates.lab3", "no_updates.lab4",
+    "no_updates.lab5", "no_updates.lab6", "no_updates.lab7"};
+
+std::atomic<bool> gLab[kLabCount];
+Fn gLabOrig[kLabCount]{};
+
+template <size_t I>
+uintptr_t labDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                    void *g, void *h) {
+  if (gLab[I].load(std::memory_order_relaxed))
+    return 0;
+  return gLabOrig[I](a, b, c, d, e, f, g, h);
+}
+
+template <size_t... I>
+std::array<void *, sizeof...(I)> makeLabDetours(std::index_sequence<I...>) {
+  return {reinterpret_cast<void *>(&labDetour<I>)...};
+}
+
+bool matchHex(const void *p, const char *hex) {
+  auto nib = [](char ch) { return ch <= '9' ? ch - '0' : ch - 'a' + 10; };
+  const unsigned char *b = static_cast<const unsigned char *>(p);
+  for (int i = 0; i < 16; ++i)
+    if (b[i] != ((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1])))
+      return false;
+  return true;
+}
+
 uintptr_t findBase() {
   std::ifstream maps("/proc/self/maps");
   std::string line;
@@ -103,9 +148,55 @@ uintptr_t findBase() {
   return 0;
 }
 
-void onToggle(std::string_view, bool enabled) {
-  for (int i = 0; i < 3; ++i)
-    gFrozen[i].store(enabled);
+// Remember the last switch position so the freeze is active from the very
+// first moment of the next launch (before the world loads).
+std::string statePath() {
+  std::string pkg;
+  {
+    std::ifstream f("/proc/self/cmdline");
+    std::getline(f, pkg, '\0');
+  }
+  if (pkg.empty())
+    pkg = "com.mojang.minecraftpe";
+  const char *dirs[] = {"/data/data/", "/storage/emulated/0/Android/data/"};
+  for (const char *d : dirs) {
+    std::string path = std::string(d) + pkg + "/files/no_updates.state";
+    std::ifstream t(path);
+    std::ofstream w(path, std::ios::app);
+    if (t.good() || w.good())
+      return path;
+  }
+  return {};
+}
+
+bool loadState() {
+  std::string p = statePath();
+  if (p.empty())
+    return false;
+  std::ifstream f(p);
+  char c = '0';
+  f >> c;
+  return c == '1';
+}
+
+void saveState(bool on) {
+  std::string p = statePath();
+  if (p.empty())
+    return;
+  std::ofstream f(p, std::ios::trunc);
+  f << (on ? '1' : '0');
+}
+
+void onToggle(std::string_view id, bool enabled) {
+  if (id == kModuleId) {
+    for (int i = 0; i < 3; ++i)
+      gFrozen[i].store(enabled);
+    saveState(enabled);
+    return;
+  }
+  for (size_t i = 0; i < kLabCount; ++i)
+    if (id == kLabIds[i])
+      gLab[i].store(enabled);
 }
 
 } // namespace
@@ -128,6 +219,9 @@ public:
       log.info("libminecraftpe.so not found");
       return false;
     }
+    const bool savedOn = loadState();
+    for (int i = 0; i < 3; ++i)
+      gFrozen[i].store(savedOn);
     static const auto detours = makeDetours(std::make_index_sequence<kCount>{});
     int ok = 0, bad = 0;
     for (size_t i = 0; i < kCount; ++i) {
@@ -149,19 +243,48 @@ public:
     if (ok == 0)
       return false;
 
-    return pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
+    bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
         .modId(mSelf.getId())
         .description("Freezes block updates: sand, gravel, water, lava, "
                      "redstone, plants, fire, ladders and more stay frozen.")
-        .defaultEnabled(false)
+        .defaultEnabled(savedOn)
         .onToggle(onToggle)
         .registerModule();
+
+    static const auto labDetours =
+        makeLabDetours(std::make_index_sequence<kLabCount>{});
+    int labOk = 0;
+    for (size_t i = 0; i < kLabCount; ++i) {
+      auto *addr = reinterpret_cast<void *>(base + kLab[i].rva);
+      if (!matchHex(addr, kLab[i].hex))
+        continue;
+      mLabHooks[i] = pl::memory::HookHandle(
+          addr, labDetours[i], reinterpret_cast<void **>(&gLabOrig[i]),
+          pl::memory::HookPriority::Normal);
+      if (!mLabHooks[i].installed())
+        continue;
+      ++labOk;
+      r &= pl::modmenu::ModuleBuilder(kLabIds[i], kLab[i].name)
+               .modId(mSelf.getId())
+               .description("Test: skips one DoublePlant function.")
+               .defaultEnabled(false)
+               .onToggle(onToggle)
+               .registerModule();
+    }
+    log.info("{}/{} plant test hooks installed", labOk,
+             static_cast<int>(kLabCount));
+    return r;
   }
 
   bool disable() {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(false);
     pl::modmenu::unregisterModule(kModuleId);
+    for (size_t i = 0; i < kLabCount; ++i) {
+      gLab[i].store(false);
+      pl::modmenu::unregisterModule(kLabIds[i]);
+      mLabHooks[i].reset();
+    }
     for (auto &h : mHooks)
       h.reset();
     return true;
@@ -172,6 +295,7 @@ public:
 private:
   ll::mod::NativeMod &mSelf;
   std::array<pl::memory::HookHandle, kCount> mHooks;
+  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
