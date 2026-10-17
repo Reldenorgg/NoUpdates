@@ -573,4 +573,10 @@ public:
 
 private:
   ll::mod::NativeMod &mSelf;
-  b
+  bool mTapOk = false;
+  std::array<pl::memory::HookHandle, kCount> mHooks;
+  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
+  std::array<pl::memory::HookHandle, kSmCount> mSmHooks;
+};
+
+PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
