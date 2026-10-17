@@ -456,17 +456,24 @@ public:
     if (ok == 0)
       return false;
 
-    // ---- log file location
-    gLogPath = "/sdcard/Download/axiom_input.log";
+    // ---- log file location (new name: avoids old file owned by another app)
     {
-      std::ofstream t(gLogPath, std::ios::app);
-      if (!t.good()) {
+      const char *cands[] = {"/sdcard/Download/axiom_log2.txt",
+                             "/sdcard/axiom_log2.txt"};
+      gLogPath.clear();
+      for (const char *c : cands) {
+        std::ofstream t(c, std::ios::app);
+        if (t.good()) {
+          gLogPath = c;
+          break;
+        }
+      }
+      if (gLogPath.empty()) {
         std::string d = filesDir();
-        if (!d.empty())
-          gLogPath = d + "axiom_input.log";
+        gLogPath = d.empty() ? "/dev/null" : d + "axiom_log2.txt";
       }
     }
-    logLine("--- axiom log start ---");
+    logLine("--- axiom log start (v0.2) --- path=" + gLogPath);
 
     // ---- GameMode hooks
     static const auto labDetours =
@@ -502,81 +509,62 @@ public:
     log.info("{}/{} screen model hooks installed", smOk,
              static_cast<int>(kSmCount));
 
-    // ---- menu
-    bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
-                 .modId(mSelf.getId())
-                 .description("Freezes block updates: sand, gravel, water, "
-                              "lava, redstone, plants, fire, ladders...")
-                 .defaultEnabled(savedOn)
-                 .onToggle(onToggle)
-                 .registerModule();
+    logLine("hooks: noupdates=" + std::to_string(ok) + " gamemode=" +
+            std::to_string(labOk) + " screenmodel=" + std::to_string(smOk) +
+            " tapHook=" + std::string(mTapOk ? "yes" : "no"));
 
+    bool r = true;
+    auto reg = [&](const char *what, auto &&fn) {
+      bool res = false;
+      try {
+        res = fn();
+        logLine(std::string("register ") + what + (res ? ": ok" : ": FAILED"));
+      } catch (...) {
+        logLine(std::string("register ") + what + ": EXCEPTION");
+      }
+      r &= res;
+    };
+
+    reg("No Updates", [&] {
+      return pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
+          .modId(mSelf.getId())
+          .description("Freezes block updates: sand, gravel, water, lava, "
+                       "redstone, plants, fire, ladders...")
+          .defaultEnabled(savedOn)
+          .onToggle(onToggle)
+          .registerModule();
+    });
     if (labOk > 0)
-      r &= pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
-               .modId(mSelf.getId())
-               .description("Test: block taps to Download/axiom_input.log")
-               .defaultEnabled(false)
-               .onToggle(onToggle)
-               .registerModule();
+      reg("Input Log", [&] {
+        return pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
+            .modId(mSelf.getId())
+            .description("Test: block taps to the log file")
+            .defaultEnabled(false)
+            .onToggle(onToggle)
+            .registerModule();
+      });
     if (smOk > 0)
-      r &= pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
-               .modId(mSelf.getId())
-               .description("Test: type in chat while on; strings go to "
-                            "Download/axiom_input.log")
-               .defaultEnabled(false)
-               .onToggle(onToggle)
-               .registerModule();
+      reg("Command Log", [&] {
+        return pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
+            .modId(mSelf.getId())
+            .description("Test: type in chat while on; strings go to the log")
+            .defaultEnabled(false)
+            .onToggle(onToggle)
+            .registerModule();
+      });
     if (mTapOk) {
-      pl::modmenu::registerImage("axiom.red", solid(230, 40, 40, 230), 8, 8);
-      pl::modmenu::registerImage("axiom.gray", solid(90, 90, 90, 140), 8, 8);
-      r &= pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
-               .modId(mSelf.getId())
-               .description("Select button: tap it, then tap two blocks "
-                            "(Pos1, Pos2).")
-               .defaultEnabled(true)
-               .onToggle(onToggle)
-               .registerModule();
-      r &= pl::modmenu::ButtonBuilder(kButtonId, "Select")
-               .modId(mSelf.getId())
-               .moduleId(kToolsId)
-               .label("Select")
-               .androidKeyCode(0)
-               .behavior(pl::modmenu::ButtonBehavior::Click)
-               .onEvent(onButton)
-               .registerButton();
-      updateHud();
-    }
-    return r;
-  }
-
-  bool disable() {
-    for (int i = 0; i < 3; ++i)
-      gFrozen[i].store(false);
-    gArmed.store(false);
-    gLog.store(false);
-    gCmdLog.store(false);
-    pl::modmenu::unregisterButton(kButtonId);
-    pl::modmenu::unregisterModule(kToolsId);
-    pl::modmenu::unregisterModule(kModuleId);
-    pl::modmenu::unregisterModule(kLogId);
-    pl::modmenu::unregisterModule(kCmdLogId);
-    for (auto &h : mSmHooks)
-      h.reset();
-    for (auto &h : mLabHooks)
-      h.reset();
-    for (auto &h : mHooks)
-      h.reset();
-    return true;
-  }
-
-  bool unload() { return true; }
-
-private:
-  ll::mod::NativeMod &mSelf;
-  bool mTapOk = false;
-  std::array<pl::memory::HookHandle, kCount> mHooks;
-  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
-  std::array<pl::memory::HookHandle, kSmCount> mSmHooks;
-};
-
-PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
+      reg("images", [&] {
+        bool a1 = pl::modmenu::registerImage("axiom.red",
+                                             solid(230, 40, 40, 230), 8, 8);
+        bool a2 = pl::modmenu::registerImage("axiom.gray",
+                                             solid(90, 90, 90, 140), 8, 8);
+        return a1 && a2;
+      });
+      reg("Axiom Tools", [&] {
+        return pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
+            .modId(mSelf.getId())
+            .description("Select button: tap it, then tap two blocks "
+                         "(Pos1, Pos2).")
+            .defaultEnabled(true)
+            .onToggle(onToggle)
+            .registerModule()
