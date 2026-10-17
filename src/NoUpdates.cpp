@@ -511,6 +511,21 @@ public:
                  .onToggle(onToggle)
                  .registerModule();
 
+    if (labOk > 0)
+      r &= pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
+               .modId(mSelf.getId())
+               .description("Test: block taps to Download/axiom_input.log")
+               .defaultEnabled(false)
+               .onToggle(onToggle)
+               .registerModule();
+    if (smOk > 0)
+      r &= pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
+               .modId(mSelf.getId())
+               .description("Test: type in chat while on; strings go to "
+                            "Download/axiom_input.log")
+               .defaultEnabled(false)
+               .onToggle(onToggle)
+               .registerModule();
     if (mTapOk) {
       pl::modmenu::registerImage("axiom.red", solid(230, 40, 40, 230), 8, 8);
       pl::modmenu::registerImage("axiom.gray", solid(90, 90, 90, 140), 8, 8);
@@ -531,21 +546,6 @@ public:
                .registerButton();
       updateHud();
     }
-    if (labOk > 0)
-      r &= pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
-               .modId(mSelf.getId())
-               .description("Test: block taps to Download/axiom_input.log")
-               .defaultEnabled(false)
-               .onToggle(onToggle)
-               .registerModule();
-    if (smOk > 0)
-      r &= pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
-               .modId(mSelf.getId())
-               .description("Test: type in chat while on; strings go to "
-                            "Download/axiom_input.log")
-               .defaultEnabled(false)
-               .onToggle(onToggle)
-               .registerModule();
     return r;
   }
 
