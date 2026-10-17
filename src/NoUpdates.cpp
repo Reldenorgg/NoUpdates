@@ -1,21 +1,25 @@
-// No Updates v3 (+ input log test) - freezes block behaviour on Minecraft Bedrock 26.52.3 (arm64)
-// by neutralising block event handlers. One switch controls three groups:
-//   0 Physics   : sand/gravel/concrete powder, water, lava
-//   1 Redstone  : redstone wire/torch/repeater/comparator/doors/pistons...
-//   2 Ticks     : scheduled + random block ticks (plants, fire, ladders...)
+// Axiom for Levi v0.1 - Minecraft Bedrock 26.52.3 (arm64)
+//  * No Updates: freezes block events (physics, redstone, ticks)
+//  * Select: one button arms selection; next two block taps set Pos1 and Pos2
+//  * Test modules: Input Log and Command Log (to locate game functions)
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
 #include <pl/memory/Hook.hpp>
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -68,6 +72,10 @@ constexpr unsigned char kExpected[16] = {0x02, 0x20, 0x41, 0xa9, 0x09, 0x04,
                                          0x68, 0x00, 0x00, 0x36};
 
 constexpr const char *kModuleId = "no_updates.main";
+constexpr const char *kToolsId = "axiom.tools";
+constexpr const char *kButtonId = "axiom.select";
+constexpr const char *kLogId = "no_updates.inputlog";
+constexpr const char *kCmdLogId = "axiom.cmdlog";
 
 using Fn = uintptr_t (*)(void *, void *, void *, void *, void *, void *,
                          void *, void *);
@@ -88,7 +96,127 @@ std::array<void *, sizeof...(I)> makeDetours(std::index_sequence<I...>) {
   return {reinterpret_cast<void *>(&detour<I>)...};
 }
 
-// ---- Input lab: GameMode virtuals (tap/break/place), logs block positions ----
+// ---------------------------------------------------------------- helpers
+bool safeRead(const void *p, void *out, size_t n) {
+  if (!p)
+    return false;
+  struct iovec l{out, n};
+  struct iovec r{const_cast<void *>(p), n};
+  return process_vm_readv(getpid(), &l, 1, &r, 1, 0) ==
+         static_cast<ssize_t>(n);
+}
+
+bool matchHex(const void *p, const char *hex) {
+  auto nib = [](char ch) { return ch <= '9' ? ch - '0' : ch - 'a' + 10; };
+  const unsigned char *b = static_cast<const unsigned char *>(p);
+  for (int i = 0; i < 16; ++i)
+    if (b[i] != ((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1])))
+      return false;
+  return true;
+}
+
+std::string gLogPath;
+void logLine(const std::string &line) {
+  std::ofstream f(gLogPath, std::ios::app);
+  if (f.good())
+    f << line << "\n";
+}
+
+// libc++ (NDK) std::string, read from another address
+bool readStdString(const void *p, std::string &out) {
+  unsigned char raw[24];
+  if (!safeRead(p, raw, sizeof(raw)))
+    return false;
+  if ((raw[0] & 1) == 0) {
+    size_t len = raw[0] >> 1;
+    if (len == 0 || len > 22)
+      return false;
+    out.assign(reinterpret_cast<char *>(raw) + 1, len);
+  } else {
+    uint64_t size;
+    const char *data;
+    std::memcpy(&size, raw + 8, 8);
+    std::memcpy(&data, raw + 16, 8);
+    if (size == 0 || size > 300)
+      return false;
+    out.resize(size);
+    if (!safeRead(data, out.data(), size))
+      return false;
+  }
+  for (char ch : out)
+    if (static_cast<unsigned char>(ch) < 32 ||
+        static_cast<unsigned char>(ch) > 126)
+      return false;
+  return true;
+}
+
+// ------------------------------------------------------- selection (Axiom)
+std::atomic<bool> gArmed{false};
+std::mutex gSelMu;
+int gPos[2][3];
+bool gHave[2];
+int gNext = 0;
+bool gToolsOn = true;
+
+void updateHud() {
+  bool a = gArmed.load(), h0, h1;
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    h0 = gHave[0];
+    h1 = gHave[1];
+  }
+  auto img = [](bool on) { return on ? "axiom.red" : "axiom.gray"; };
+  const std::vector<pl::modmenu::DrawCommand> commands = {
+      {.type = pl::modmenu::DrawCommandType::Image, .x = 24.0f, .y = 140.0f,
+       .w = 28.0f, .h = 28.0f, .imageId = img(a)},
+      {.type = pl::modmenu::DrawCommandType::Image, .x = 64.0f, .y = 140.0f,
+       .w = 28.0f, .h = 28.0f, .imageId = img(h0)},
+      {.type = pl::modmenu::DrawCommandType::Image, .x = 104.0f, .y = 140.0f,
+       .w = 28.0f, .h = 28.0f, .imageId = img(h1)},
+  };
+  pl::modmenu::submitDrawCommands(kToolsId, commands);
+}
+
+void handleTap(void *posPtr) {
+  int pos[3];
+  if (!safeRead(posPtr, pos, sizeof(pos)))
+    return;
+  int idx;
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    idx = gNext;
+    std::memcpy(gPos[idx], pos, sizeof(pos));
+    gHave[idx] = true;
+    gNext = (gNext + 1) % 2;
+  }
+  if (idx == 1)
+    gArmed.store(false); // both points set: back to normal taps
+  char buf[96];
+  snprintf(buf, sizeof(buf), "SELECT pos%d = (%d,%d,%d)", idx + 1, pos[0],
+           pos[1], pos[2]);
+  logLine(buf);
+  updateHud();
+}
+
+void onButton(std::string_view, pl::modmenu::ButtonEvent, float) {
+  static std::atomic<long long> last{0};
+  long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+  if (now - last.load() < 300)
+    return;
+  last.store(now);
+  bool arm = !gArmed.load();
+  if (arm) {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    gHave[0] = gHave[1] = false;
+    gNext = 0;
+  }
+  gArmed.store(arm);
+  updateHud();
+}
+
+// ------------------------------------- GameMode virtuals (tap/break/place)
 struct Lab {
   uintptr_t rva;
   const char *hex; // first 16 bytes expected at rva
@@ -104,44 +232,35 @@ constexpr Lab kLab[] = {
     {0xf8a16ec, "ff0305d1e9230d6dfd7b0ea9fc6f0fa9", "slot8 continueBuild?"},
 };
 constexpr size_t kLabCount = sizeof(kLab) / sizeof(kLab[0]);
-constexpr const char *kLabModuleId = "no_updates.inputlog";
+constexpr size_t kBuildIdx = 5; // slot7: block tap / place
 
 std::atomic<bool> gLog{false};
 std::atomic<int> gLogCount{0};
 std::atomic<uint64_t> gLastKey[kLabCount];
 Fn gLabOrig[kLabCount]{};
-std::string gLogPath;
-
-bool safeRead(const void *p, void *out, size_t n) {
-  if (!p)
-    return false;
-  struct iovec l{out, n};
-  struct iovec r{const_cast<void *>(p), n};
-  return process_vm_readv(getpid(), &l, 1, &r, 1, 0) ==
-         static_cast<ssize_t>(n);
-}
-
-void logLine(const std::string &line) {
-  std::ofstream f(gLogPath, std::ios::app);
-  if (f.good())
-    f << line << "\n";
-}
 
 template <size_t I>
 uintptr_t labDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                     void *g, void *h) {
+  if constexpr (I == kBuildIdx) {
+    if (gArmed.load(std::memory_order_relaxed)) {
+      handleTap(b);
+      return 0; // swallow the tap: no block placed
+    }
+  }
   if (gLog.load(std::memory_order_relaxed) && gLogCount.load() < 400) {
     int pos[3] = {0, 0, 0};
     const bool ok = safeRead(b, pos, sizeof(pos));
-    const unsigned face = static_cast<unsigned>(reinterpret_cast<uintptr_t>(c) & 0xff);
-    uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(pos[0])) * 73856093ull) ^
-                   (static_cast<uint64_t>(static_cast<uint32_t>(pos[1])) * 19349663ull) ^
-                   (static_cast<uint64_t>(static_cast<uint32_t>(pos[2])) * 83492791ull) ^
-                   face ^ (ok ? 0 : 0x5555);
+    const unsigned face =
+        static_cast<unsigned>(reinterpret_cast<uintptr_t>(c) & 0xff);
+    uint64_t key =
+        (static_cast<uint64_t>(static_cast<uint32_t>(pos[0])) * 73856093ull) ^
+        (static_cast<uint64_t>(static_cast<uint32_t>(pos[1])) * 19349663ull) ^
+        (static_cast<uint64_t>(static_cast<uint32_t>(pos[2])) * 83492791ull) ^
+        face ^ (ok ? 0 : 0x5555);
     if (gLastKey[I].exchange(key) != key) {
       char buf[256];
-      snprintf(buf, sizeof(buf),
-               "[%d] %s pos=(%d,%d,%d)%s face=%u c=%p d=%p",
+      snprintf(buf, sizeof(buf), "[%d] %s pos=(%d,%d,%d)%s face=%u c=%p d=%p",
                gLogCount.fetch_add(1), kLab[I].name, pos[0], pos[1], pos[2],
                ok ? "" : "?", face, c, d);
       logLine(buf);
@@ -155,15 +274,60 @@ std::array<void *, sizeof...(I)> makeLabDetours(std::index_sequence<I...>) {
   return {reinterpret_cast<void *>(&labDetour<I>)...};
 }
 
-bool matchHex(const void *p, const char *hex) {
-  auto nib = [](char ch) { return ch <= '9' ? ch - '0' : ch - 'a' + 10; };
-  const unsigned char *b = static_cast<const unsigned char *>(p);
-  for (int i = 0; i < 16; ++i)
-    if (b[i] != ((nib(hex[2 * i]) << 4) | nib(hex[2 * i + 1])))
-      return false;
-  return true;
+// --------------- ClientInstanceScreenModel virtuals (chat / commands test)
+struct SmSlot {
+  uintptr_t rva;
+  const char *hex;
+  int slot;
+};
+constexpr SmSlot kSm[] = {
+    {0xa148dd8, "fd7bbea9f30b00f9fd030091082440f9", 2},
+    {0xa1399f0, "ff0302d1fd7b05a9f65706a9f44f07a9", 5},
+    {0xa138824, "fd7bbba9fc0b00f9f85f02a9f65703a9", 6},
+    {0xa138d14, "ffc301d1fd7b03a9f85f04a9f65705a9", 7},
+    {0xa133734, "ff4302d1fd7b04a9f92b00f9f85f06a9", 8},
+    {0xa15d704, "fd7bbea9f30b00f9fd030091082440f9", 12},
+    {0xa146768, "ff0303d1fd7b09a9f6570aa9f44f0ba9", 13},
+    {0xa133b5c, "fd7bbea9f44f01a9fd030091083040f9", 15},
+    {0xa154f2c, "fd7bbea9f30b00f9fd030091082440f9", 17},
+    {0xa141d70, "ffc301d1fd7b03a9f72300f9f65705a9", 18},
+    {0xa15eab4, "ff4301d1fd7b02a9f51b00f9f44f04a9", 24},
+    {0xa16f6ac, "fd7bbea9f30b00f9fd030091082440f9", 26},
+    {0xa1708ec, "ffc301d1fd7b04a9f52b00f9f44f06a9", 27},
+};
+constexpr size_t kSmCount = sizeof(kSm) / sizeof(kSm[0]);
+
+std::atomic<bool> gCmdLog{false};
+std::atomic<int> gCmdCount{0};
+std::atomic<uint64_t> gSmLast[kSmCount];
+std::atomic<void *> gSmThis{nullptr};
+Fn gSmOrig[kSmCount]{};
+
+template <size_t I>
+uintptr_t smDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                   void *g, void *h) {
+  if (gCmdLog.load(std::memory_order_relaxed) && gCmdCount.load() < 300) {
+    std::string s;
+    if (readStdString(b, s)) {
+      uint64_t key = std::hash<std::string>{}(s);
+      if (gSmLast[I].exchange(key) != key) {
+        gSmThis.store(a);
+        char buf[400];
+        snprintf(buf, sizeof(buf), "[%d] SM slot%d this=%p str='%.200s'",
+                 gCmdCount.fetch_add(1), kSm[I].slot, a, s.c_str());
+        logLine(buf);
+      }
+    }
+  }
+  return gSmOrig[I](a, b, c, d, e, f, g, h);
 }
 
+template <size_t... I>
+std::array<void *, sizeof...(I)> makeSmDetours(std::index_sequence<I...>) {
+  return {reinterpret_cast<void *>(&smDetour<I>)...};
+}
+
+// ------------------------------------------------------------------ misc
 uintptr_t findBase() {
   std::ifstream maps("/proc/self/maps");
   std::string line;
@@ -181,9 +345,7 @@ uintptr_t findBase() {
   return 0;
 }
 
-// Remember the last switch position so the freeze is active from the very
-// first moment of the next launch (before the world loads).
-std::string statePath() {
+std::string filesDir() {
   std::string pkg;
   {
     std::ifstream f("/proc/self/cmdline");
@@ -193,30 +355,29 @@ std::string statePath() {
     pkg = "com.mojang.minecraftpe";
   const char *dirs[] = {"/data/data/", "/storage/emulated/0/Android/data/"};
   for (const char *d : dirs) {
-    std::string path = std::string(d) + pkg + "/files/no_updates.state";
-    std::ifstream t(path);
-    std::ofstream w(path, std::ios::app);
-    if (t.good() || w.good())
-      return path;
+    std::string base = std::string(d) + pkg + "/files/";
+    std::ofstream w(base + "no_updates.state", std::ios::app);
+    if (w.good())
+      return base;
   }
-  return {};
+  return "";
 }
 
 bool loadState() {
-  std::string p = statePath();
-  if (p.empty())
+  std::string d = filesDir();
+  if (d.empty())
     return false;
-  std::ifstream f(p);
+  std::ifstream f(d + "no_updates.state");
   char c = '0';
   f >> c;
   return c == '1';
 }
 
 void saveState(bool on) {
-  std::string p = statePath();
-  if (p.empty())
+  std::string d = filesDir();
+  if (d.empty())
     return;
-  std::ofstream f(p, std::ios::trunc);
+  std::ofstream f(d + "no_updates.state", std::ios::trunc);
   f << (on ? '1' : '0');
 }
 
@@ -225,10 +386,28 @@ void onToggle(std::string_view id, bool enabled) {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(enabled);
     saveState(enabled);
-    return;
-  }
-  if (id == kLabModuleId)
+  } else if (id == kLogId) {
     gLog.store(enabled);
+  } else if (id == kCmdLogId) {
+    gCmdLog.store(enabled);
+  } else if (id == kToolsId) {
+    gToolsOn = enabled;
+    if (!enabled)
+      gArmed.store(false);
+    updateHud();
+  }
+}
+
+std::vector<unsigned char> solid(unsigned char r, unsigned char g,
+                                 unsigned char b, unsigned char a) {
+  std::vector<unsigned char> px(8 * 8 * 4);
+  for (size_t i = 0; i < 64; ++i) {
+    px[i * 4] = r;
+    px[i * 4 + 1] = g;
+    px[i * 4 + 2] = b;
+    px[i * 4 + 3] = a;
+  }
+  return px;
 }
 
 } // namespace
@@ -254,6 +433,8 @@ public:
     const bool savedOn = loadState();
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(savedOn);
+
+    // ---- No Updates hooks
     static const auto detours = makeDetours(std::make_index_sequence<kCount>{});
     int ok = 0, bad = 0;
     for (size_t i = 0; i < kCount; ++i) {
@@ -275,25 +456,19 @@ public:
     if (ok == 0)
       return false;
 
-    bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
-        .modId(mSelf.getId())
-        .description("Freezes block updates: sand, gravel, water, lava, "
-                     "redstone, plants, fire, ladders and more stay frozen.")
-        .defaultEnabled(savedOn)
-        .onToggle(onToggle)
-        .registerModule();
-
+    // ---- log file location
+    gLogPath = "/sdcard/Download/axiom_input.log";
     {
-      std::string sp = statePath();
-      const std::string tail = "no_updates.state";
-      gLogPath = "/sdcard/Download/axiom_input.log";
-      {
-        std::ofstream t(gLogPath, std::ios::app);
-        if (!t.good() && sp.size() > tail.size())
-          gLogPath = sp.substr(0, sp.size() - tail.size()) + "axiom_input.log";
+      std::ofstream t(gLogPath, std::ios::app);
+      if (!t.good()) {
+        std::string d = filesDir();
+        if (!d.empty())
+          gLogPath = d + "axiom_input.log";
       }
-      logLine("--- input log start ---");
     }
+    logLine("--- axiom log start ---");
+
+    // ---- GameMode hooks
     static const auto labDetours =
         makeLabDetours(std::make_index_sequence<kLabCount>{});
     int labOk = 0;
@@ -308,10 +483,65 @@ public:
         ++labOk;
     }
     log.info("{}/{} input hooks installed", labOk, static_cast<int>(kLabCount));
-    if (labOk > 0)
-      r &= pl::modmenu::ModuleBuilder(kLabModuleId, "Input Log (test)")
+    mTapOk = mLabHooks[kBuildIdx].installed();
+
+    // ---- ScreenModel hooks (command test)
+    static const auto smDetours =
+        makeSmDetours(std::make_index_sequence<kSmCount>{});
+    int smOk = 0;
+    for (size_t i = 0; i < kSmCount; ++i) {
+      auto *addr = reinterpret_cast<void *>(base + kSm[i].rva);
+      if (!matchHex(addr, kSm[i].hex))
+        continue;
+      mSmHooks[i] = pl::memory::HookHandle(
+          addr, smDetours[i], reinterpret_cast<void **>(&gSmOrig[i]),
+          pl::memory::HookPriority::Normal);
+      if (mSmHooks[i].installed())
+        ++smOk;
+    }
+    log.info("{}/{} screen model hooks installed", smOk,
+             static_cast<int>(kSmCount));
+
+    // ---- menu
+    bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
+                 .modId(mSelf.getId())
+                 .description("Freezes block updates: sand, gravel, water, "
+                              "lava, redstone, plants, fire, ladders...")
+                 .defaultEnabled(savedOn)
+                 .onToggle(onToggle)
+                 .registerModule();
+
+    if (mTapOk) {
+      pl::modmenu::registerImage("axiom.red", solid(230, 40, 40, 230), 8, 8);
+      pl::modmenu::registerImage("axiom.gray", solid(90, 90, 90, 140), 8, 8);
+      r &= pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
                .modId(mSelf.getId())
-               .description("Test: writes tapped block positions to "
+               .description("Select button: tap it, then tap two blocks "
+                            "(Pos1, Pos2).")
+               .defaultEnabled(true)
+               .onToggle(onToggle)
+               .registerModule();
+      r &= pl::modmenu::ButtonBuilder(kButtonId, "Select")
+               .modId(mSelf.getId())
+               .moduleId(kToolsId)
+               .label("Select")
+               .androidKeyCode(0)
+               .behavior(pl::modmenu::ButtonBehavior::Click)
+               .onEvent(onButton)
+               .registerButton();
+      updateHud();
+    }
+    if (labOk > 0)
+      r &= pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
+               .modId(mSelf.getId())
+               .description("Test: block taps to Download/axiom_input.log")
+               .defaultEnabled(false)
+               .onToggle(onToggle)
+               .registerModule();
+    if (smOk > 0)
+      r &= pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
+               .modId(mSelf.getId())
+               .description("Test: type in chat while on; strings go to "
                             "Download/axiom_input.log")
                .defaultEnabled(false)
                .onToggle(onToggle)
@@ -322,9 +552,16 @@ public:
   bool disable() {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(false);
-    pl::modmenu::unregisterModule(kModuleId);
+    gArmed.store(false);
     gLog.store(false);
-    pl::modmenu::unregisterModule(kLabModuleId);
+    gCmdLog.store(false);
+    pl::modmenu::unregisterButton(kButtonId);
+    pl::modmenu::unregisterModule(kToolsId);
+    pl::modmenu::unregisterModule(kModuleId);
+    pl::modmenu::unregisterModule(kLogId);
+    pl::modmenu::unregisterModule(kCmdLogId);
+    for (auto &h : mSmHooks)
+      h.reset();
     for (auto &h : mLabHooks)
       h.reset();
     for (auto &h : mHooks)
@@ -336,8 +573,4 @@ public:
 
 private:
   ll::mod::NativeMod &mSelf;
-  std::array<pl::memory::HookHandle, kCount> mHooks;
-  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
-};
-
-PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
+  b
