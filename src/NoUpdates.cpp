@@ -567,4 +567,54 @@ public:
                          "(Pos1, Pos2).")
             .defaultEnabled(true)
             .onToggle(onToggle)
-            .registerModule()
+            .registerModule();
+      });
+      reg("Select button", [&] {
+        return pl::modmenu::ButtonBuilder(kButtonId, "Select")
+            .modId(mSelf.getId())
+            .moduleId(kToolsId)
+            .label("Select")
+            .androidKeyCode(0)
+            .behavior(pl::modmenu::ButtonBehavior::Click)
+            .onEvent(onButton)
+            .registerButton();
+      });
+      reg("HUD", [&] {
+        updateHud();
+        return true;
+      });
+    }
+    return r;
+  }
+
+  bool disable() {
+    for (int i = 0; i < 3; ++i)
+      gFrozen[i].store(false);
+    gArmed.store(false);
+    gLog.store(false);
+    gCmdLog.store(false);
+    pl::modmenu::unregisterButton(kButtonId);
+    pl::modmenu::unregisterModule(kToolsId);
+    pl::modmenu::unregisterModule(kModuleId);
+    pl::modmenu::unregisterModule(kLogId);
+    pl::modmenu::unregisterModule(kCmdLogId);
+    for (auto &h : mSmHooks)
+      h.reset();
+    for (auto &h : mLabHooks)
+      h.reset();
+    for (auto &h : mHooks)
+      h.reset();
+    return true;
+  }
+
+  bool unload() { return true; }
+
+private:
+  ll::mod::NativeMod &mSelf;
+  bool mTapOk = false;
+  std::array<pl::memory::HookHandle, kCount> mHooks;
+  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
+  std::array<pl::memory::HookHandle, kSmCount> mSmHooks;
+};
+
+PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
