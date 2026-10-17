@@ -1,4 +1,4 @@
-// No Updates v2 - freezes block behaviour on Minecraft Bedrock 26.52.3 (arm64)
+// No Updates v3 (+ input log test) - freezes block behaviour on Minecraft Bedrock 26.52.3 (arm64)
 // by neutralising block event handlers. One switch controls three groups:
 //   0 Physics   : sand/gravel/concrete powder, water, lava
 //   1 Redstone  : redstone wire/torch/repeater/comparator/doors/pistons...
@@ -16,6 +16,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <sys/uio.h>
+#include <unistd.h>
 
 namespace {
 
@@ -86,34 +88,65 @@ std::array<void *, sizeof...(I)> makeDetours(std::index_sequence<I...>) {
   return {reinterpret_cast<void *>(&detour<I>)...};
 }
 
-// ---- Plant lab: candidate virtuals of DoublePlantBaseBlock ----
+// ---- Input lab: GameMode virtuals (tap/break/place), logs block positions ----
 struct Lab {
   uintptr_t rva;
   const char *hex; // first 16 bytes expected at rva
   const char *name;
 };
 constexpr Lab kLab[] = {
-    {0x100d2f68, "ff0302d1fd7b04a9f85f05a9f65706a9", "Plant test 1"},
-    {0x100d2cf4, "ff8301d1fd7b03a9f52300f9f44f05a9", "Plant test 2"},
-    {0x100d2bc0, "ffc301d1fd7b03a9f72300f9f65705a9", "Plant test 3"},
-    {0x100d2d94, "ffc301d1fd7b03a9f85f04a9f65705a9", "Plant test 4"},
-    {0x100d332c, "fd7bbea9f44f01a9fd030091280040f9", "Plant test 5"},
-    {0x100d342c, "fd7bbda9f50b00f9f44f02a9fd030091", "Plant test 6"},
-    {0x100d320c, "ff8303d1fd7b0ba9f6570ca9f44f0da9", "Plant test 7"},
+    {0xf89fe18, "ff8301d1fd7b01a9f91300f9f85f03a9", "slot2 startDestroy?"},
+    {0xf8a03ac, "ff0302d1fd7b04a9f85f05a9f65706a9", "slot3 destroy?"},
+    {0xf8a073c, "ff8303d1e923076dfd7b08a9fc6f09a9", "slot4 continueDestroy?"},
+    {0xf8a112c, "fd7bbea9f30b00f9fd030091f30300aa", "slot5 stopDestroy?"},
+    {0xf8a1168, "080040f91f4000b9e4031f2a051d40f9", "slot6 startBuild?"},
+    {0xf8a117c, "ffc304d1fd7b0da9fc7300f9fa670fa9", "slot7 build?"},
+    {0xf8a16ec, "ff0305d1e9230d6dfd7b0ea9fc6f0fa9", "slot8 continueBuild?"},
 };
 constexpr size_t kLabCount = sizeof(kLab) / sizeof(kLab[0]);
-constexpr const char *kLabIds[kLabCount] = {
-    "no_updates.lab1", "no_updates.lab2", "no_updates.lab3", "no_updates.lab4",
-    "no_updates.lab5", "no_updates.lab6", "no_updates.lab7"};
+constexpr const char *kLabModuleId = "no_updates.inputlog";
 
-std::atomic<bool> gLab[kLabCount];
+std::atomic<bool> gLog{false};
+std::atomic<int> gLogCount{0};
+std::atomic<uint64_t> gLastKey[kLabCount];
 Fn gLabOrig[kLabCount]{};
+std::string gLogPath;
+
+bool safeRead(const void *p, void *out, size_t n) {
+  if (!p)
+    return false;
+  struct iovec l{out, n};
+  struct iovec r{const_cast<void *>(p), n};
+  return process_vm_readv(getpid(), &l, 1, &r, 1, 0) ==
+         static_cast<ssize_t>(n);
+}
+
+void logLine(const std::string &line) {
+  std::ofstream f(gLogPath, std::ios::app);
+  if (f.good())
+    f << line << "\n";
+}
 
 template <size_t I>
 uintptr_t labDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                     void *g, void *h) {
-  if (gLab[I].load(std::memory_order_relaxed))
-    return 0;
+  if (gLog.load(std::memory_order_relaxed) && gLogCount.load() < 400) {
+    int pos[3] = {0, 0, 0};
+    const bool ok = safeRead(b, pos, sizeof(pos));
+    const unsigned face = static_cast<unsigned>(reinterpret_cast<uintptr_t>(c) & 0xff);
+    uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(pos[0])) * 73856093ull) ^
+                   (static_cast<uint64_t>(static_cast<uint32_t>(pos[1])) * 19349663ull) ^
+                   (static_cast<uint64_t>(static_cast<uint32_t>(pos[2])) * 83492791ull) ^
+                   face ^ (ok ? 0 : 0x5555);
+    if (gLastKey[I].exchange(key) != key) {
+      char buf[256];
+      snprintf(buf, sizeof(buf),
+               "[%d] %s pos=(%d,%d,%d)%s face=%u c=%p d=%p",
+               gLogCount.fetch_add(1), kLab[I].name, pos[0], pos[1], pos[2],
+               ok ? "" : "?", face, c, d);
+      logLine(buf);
+    }
+  }
   return gLabOrig[I](a, b, c, d, e, f, g, h);
 }
 
@@ -194,9 +227,8 @@ void onToggle(std::string_view id, bool enabled) {
     saveState(enabled);
     return;
   }
-  for (size_t i = 0; i < kLabCount; ++i)
-    if (id == kLabIds[i])
-      gLab[i].store(enabled);
+  if (id == kLabModuleId)
+    gLog.store(enabled);
 }
 
 } // namespace
@@ -251,6 +283,17 @@ public:
         .onToggle(onToggle)
         .registerModule();
 
+    {
+      std::string sp = statePath();
+      const std::string tail = "no_updates.state";
+      gLogPath = "/sdcard/Download/axiom_input.log";
+      {
+        std::ofstream t(gLogPath, std::ios::app);
+        if (!t.good() && sp.size() > tail.size())
+          gLogPath = sp.substr(0, sp.size() - tail.size()) + "axiom_input.log";
+      }
+      logLine("--- input log start ---");
+    }
     static const auto labDetours =
         makeLabDetours(std::make_index_sequence<kLabCount>{});
     int labOk = 0;
@@ -261,18 +304,18 @@ public:
       mLabHooks[i] = pl::memory::HookHandle(
           addr, labDetours[i], reinterpret_cast<void **>(&gLabOrig[i]),
           pl::memory::HookPriority::Normal);
-      if (!mLabHooks[i].installed())
-        continue;
-      ++labOk;
-      r &= pl::modmenu::ModuleBuilder(kLabIds[i], kLab[i].name)
+      if (mLabHooks[i].installed())
+        ++labOk;
+    }
+    log.info("{}/{} input hooks installed", labOk, static_cast<int>(kLabCount));
+    if (labOk > 0)
+      r &= pl::modmenu::ModuleBuilder(kLabModuleId, "Input Log (test)")
                .modId(mSelf.getId())
-               .description("Test: skips one DoublePlant function.")
+               .description("Test: writes tapped block positions to "
+                            "Download/axiom_input.log")
                .defaultEnabled(false)
                .onToggle(onToggle)
                .registerModule();
-    }
-    log.info("{}/{} plant test hooks installed", labOk,
-             static_cast<int>(kLabCount));
     return r;
   }
 
@@ -280,11 +323,10 @@ public:
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(false);
     pl::modmenu::unregisterModule(kModuleId);
-    for (size_t i = 0; i < kLabCount; ++i) {
-      gLab[i].store(false);
-      pl::modmenu::unregisterModule(kLabIds[i]);
-      mLabHooks[i].reset();
-    }
+    gLog.store(false);
+    pl::modmenu::unregisterModule(kLabModuleId);
+    for (auto &h : mLabHooks)
+      h.reset();
     for (auto &h : mHooks)
       h.reset();
     return true;
