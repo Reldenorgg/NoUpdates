@@ -1,27 +1,33 @@
-// Axiom for Levi v0.1 - Minecraft Bedrock 26.52.3 (arm64)
+// Axiom for Levi v0.3 - Minecraft Bedrock 26.52.3 (arm64)
 //  * No Updates: freezes block events (physics, redstone, ticks)
-//  * Select: one button arms selection; next two block taps set Pos1 and Pos2
-//  * Test modules: Input Log and Command Log (to locate game functions)
+//  * Select: HUD button arms selection; next two block taps set Pos1 / Pos2
+// HUD and touch follow the pattern used by other Levi mods: own draw
+// commands + pl::input touch callback (no ButtonBuilder).
+#include <pl/Input.hpp>
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
 #include <pl/memory/Hook.hpp>
 
+#include <dlfcn.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
-#include <sys/uio.h>
-#include <unistd.h>
 
 namespace {
 
@@ -73,9 +79,10 @@ constexpr unsigned char kExpected[16] = {0x02, 0x20, 0x41, 0xa9, 0x09, 0x04,
 
 constexpr const char *kModuleId = "no_updates.main";
 constexpr const char *kToolsId = "axiom.tools";
-constexpr const char *kButtonId = "axiom.select";
-constexpr const char *kLogId = "no_updates.inputlog";
-constexpr const char *kCmdLogId = "axiom.cmdlog";
+
+// GameMode::buildBlock (vtable slot 7), 26.52.3
+constexpr uintptr_t kBuildRva = 0xf8a117c;
+constexpr const char *kBuildHex = "ffc304d1fd7b0da9fc7300f9fa670fa9";
 
 using Fn = uintptr_t (*)(void *, void *, void *, void *, void *, void *,
                          void *, void *);
@@ -115,219 +122,13 @@ bool matchHex(const void *p, const char *hex) {
   return true;
 }
 
-std::string gLogPath;
+std::string gLogPath = "/dev/null";
 void logLine(const std::string &line) {
   std::ofstream f(gLogPath, std::ios::app);
   if (f.good())
     f << line << "\n";
 }
 
-// libc++ (NDK) std::string, read from another address
-bool readStdString(const void *p, std::string &out) {
-  unsigned char raw[24];
-  if (!safeRead(p, raw, sizeof(raw)))
-    return false;
-  if ((raw[0] & 1) == 0) {
-    size_t len = raw[0] >> 1;
-    if (len == 0 || len > 22)
-      return false;
-    out.assign(reinterpret_cast<char *>(raw) + 1, len);
-  } else {
-    uint64_t size;
-    const char *data;
-    std::memcpy(&size, raw + 8, 8);
-    std::memcpy(&data, raw + 16, 8);
-    if (size == 0 || size > 300)
-      return false;
-    out.resize(size);
-    if (!safeRead(data, out.data(), size))
-      return false;
-  }
-  for (char ch : out)
-    if (static_cast<unsigned char>(ch) < 32 ||
-        static_cast<unsigned char>(ch) > 126)
-      return false;
-  return true;
-}
-
-// ------------------------------------------------------- selection (Axiom)
-std::atomic<bool> gArmed{false};
-std::mutex gSelMu;
-int gPos[2][3];
-bool gHave[2];
-int gNext = 0;
-bool gToolsOn = true;
-
-void updateHud() {
-  bool a = gArmed.load(), h0, h1;
-  {
-    std::lock_guard<std::mutex> lk(gSelMu);
-    h0 = gHave[0];
-    h1 = gHave[1];
-  }
-  auto img = [](bool on) { return on ? "axiom.red" : "axiom.gray"; };
-  const std::vector<pl::modmenu::DrawCommand> commands = {
-      {.type = pl::modmenu::DrawCommandType::Image, .x = 24.0f, .y = 140.0f,
-       .w = 28.0f, .h = 28.0f, .imageId = img(a)},
-      {.type = pl::modmenu::DrawCommandType::Image, .x = 64.0f, .y = 140.0f,
-       .w = 28.0f, .h = 28.0f, .imageId = img(h0)},
-      {.type = pl::modmenu::DrawCommandType::Image, .x = 104.0f, .y = 140.0f,
-       .w = 28.0f, .h = 28.0f, .imageId = img(h1)},
-  };
-  pl::modmenu::submitDrawCommands(kToolsId, commands);
-}
-
-void handleTap(void *posPtr) {
-  int pos[3];
-  if (!safeRead(posPtr, pos, sizeof(pos)))
-    return;
-  int idx;
-  {
-    std::lock_guard<std::mutex> lk(gSelMu);
-    idx = gNext;
-    std::memcpy(gPos[idx], pos, sizeof(pos));
-    gHave[idx] = true;
-    gNext = (gNext + 1) % 2;
-  }
-  if (idx == 1)
-    gArmed.store(false); // both points set: back to normal taps
-  char buf[96];
-  snprintf(buf, sizeof(buf), "SELECT pos%d = (%d,%d,%d)", idx + 1, pos[0],
-           pos[1], pos[2]);
-  logLine(buf);
-  updateHud();
-}
-
-void onButton(std::string_view, pl::modmenu::ButtonEvent, float) {
-  static std::atomic<long long> last{0};
-  long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count();
-  if (now - last.load() < 300)
-    return;
-  last.store(now);
-  bool arm = !gArmed.load();
-  if (arm) {
-    std::lock_guard<std::mutex> lk(gSelMu);
-    gHave[0] = gHave[1] = false;
-    gNext = 0;
-  }
-  gArmed.store(arm);
-  updateHud();
-}
-
-// ------------------------------------- GameMode virtuals (tap/break/place)
-struct Lab {
-  uintptr_t rva;
-  const char *hex; // first 16 bytes expected at rva
-  const char *name;
-};
-constexpr Lab kLab[] = {
-    {0xf89fe18, "ff8301d1fd7b01a9f91300f9f85f03a9", "slot2 startDestroy?"},
-    {0xf8a03ac, "ff0302d1fd7b04a9f85f05a9f65706a9", "slot3 destroy?"},
-    {0xf8a073c, "ff8303d1e923076dfd7b08a9fc6f09a9", "slot4 continueDestroy?"},
-    {0xf8a112c, "fd7bbea9f30b00f9fd030091f30300aa", "slot5 stopDestroy?"},
-    {0xf8a1168, "080040f91f4000b9e4031f2a051d40f9", "slot6 startBuild?"},
-    {0xf8a117c, "ffc304d1fd7b0da9fc7300f9fa670fa9", "slot7 build?"},
-    {0xf8a16ec, "ff0305d1e9230d6dfd7b0ea9fc6f0fa9", "slot8 continueBuild?"},
-};
-constexpr size_t kLabCount = sizeof(kLab) / sizeof(kLab[0]);
-constexpr size_t kBuildIdx = 5; // slot7: block tap / place
-
-std::atomic<bool> gLog{false};
-std::atomic<int> gLogCount{0};
-std::atomic<uint64_t> gLastKey[kLabCount];
-Fn gLabOrig[kLabCount]{};
-
-template <size_t I>
-uintptr_t labDetour(void *a, void *b, void *c, void *d, void *e, void *f,
-                    void *g, void *h) {
-  if constexpr (I == kBuildIdx) {
-    if (gArmed.load(std::memory_order_relaxed)) {
-      handleTap(b);
-      return 0; // swallow the tap: no block placed
-    }
-  }
-  if (gLog.load(std::memory_order_relaxed) && gLogCount.load() < 400) {
-    int pos[3] = {0, 0, 0};
-    const bool ok = safeRead(b, pos, sizeof(pos));
-    const unsigned face =
-        static_cast<unsigned>(reinterpret_cast<uintptr_t>(c) & 0xff);
-    uint64_t key =
-        (static_cast<uint64_t>(static_cast<uint32_t>(pos[0])) * 73856093ull) ^
-        (static_cast<uint64_t>(static_cast<uint32_t>(pos[1])) * 19349663ull) ^
-        (static_cast<uint64_t>(static_cast<uint32_t>(pos[2])) * 83492791ull) ^
-        face ^ (ok ? 0 : 0x5555);
-    if (gLastKey[I].exchange(key) != key) {
-      char buf[256];
-      snprintf(buf, sizeof(buf), "[%d] %s pos=(%d,%d,%d)%s face=%u c=%p d=%p",
-               gLogCount.fetch_add(1), kLab[I].name, pos[0], pos[1], pos[2],
-               ok ? "" : "?", face, c, d);
-      logLine(buf);
-    }
-  }
-  return gLabOrig[I](a, b, c, d, e, f, g, h);
-}
-
-template <size_t... I>
-std::array<void *, sizeof...(I)> makeLabDetours(std::index_sequence<I...>) {
-  return {reinterpret_cast<void *>(&labDetour<I>)...};
-}
-
-// --------------- ClientInstanceScreenModel virtuals (chat / commands test)
-struct SmSlot {
-  uintptr_t rva;
-  const char *hex;
-  int slot;
-};
-constexpr SmSlot kSm[] = {
-    {0xa148dd8, "fd7bbea9f30b00f9fd030091082440f9", 2},
-    {0xa1399f0, "ff0302d1fd7b05a9f65706a9f44f07a9", 5},
-    {0xa138824, "fd7bbba9fc0b00f9f85f02a9f65703a9", 6},
-    {0xa138d14, "ffc301d1fd7b03a9f85f04a9f65705a9", 7},
-    {0xa133734, "ff4302d1fd7b04a9f92b00f9f85f06a9", 8},
-    {0xa15d704, "fd7bbea9f30b00f9fd030091082440f9", 12},
-    {0xa146768, "ff0303d1fd7b09a9f6570aa9f44f0ba9", 13},
-    {0xa133b5c, "fd7bbea9f44f01a9fd030091083040f9", 15},
-    {0xa154f2c, "fd7bbea9f30b00f9fd030091082440f9", 17},
-    {0xa141d70, "ffc301d1fd7b03a9f72300f9f65705a9", 18},
-    {0xa15eab4, "ff4301d1fd7b02a9f51b00f9f44f04a9", 24},
-    {0xa16f6ac, "fd7bbea9f30b00f9fd030091082440f9", 26},
-    {0xa1708ec, "ffc301d1fd7b04a9f52b00f9f44f06a9", 27},
-};
-constexpr size_t kSmCount = sizeof(kSm) / sizeof(kSm[0]);
-
-std::atomic<bool> gCmdLog{false};
-std::atomic<int> gCmdCount{0};
-std::atomic<uint64_t> gSmLast[kSmCount];
-std::atomic<void *> gSmThis{nullptr};
-Fn gSmOrig[kSmCount]{};
-
-template <size_t I>
-uintptr_t smDetour(void *a, void *b, void *c, void *d, void *e, void *f,
-                   void *g, void *h) {
-  if (gCmdLog.load(std::memory_order_relaxed) && gCmdCount.load() < 300) {
-    std::string s;
-    if (readStdString(b, s)) {
-      uint64_t key = std::hash<std::string>{}(s);
-      if (gSmLast[I].exchange(key) != key) {
-        gSmThis.store(a);
-        char buf[400];
-        snprintf(buf, sizeof(buf), "[%d] SM slot%d this=%p str='%.200s'",
-                 gCmdCount.fetch_add(1), kSm[I].slot, a, s.c_str());
-        logLine(buf);
-      }
-    }
-  }
-  return gSmOrig[I](a, b, c, d, e, f, g, h);
-}
-
-template <size_t... I>
-std::array<void *, sizeof...(I)> makeSmDetours(std::index_sequence<I...>) {
-  return {reinterpret_cast<void *>(&smDetour<I>)...};
-}
-
-// ------------------------------------------------------------------ misc
 uintptr_t findBase() {
   std::ifstream maps("/proc/self/maps");
   std::string line;
@@ -381,33 +182,276 @@ void saveState(bool on) {
   f << (on ? '1' : '0');
 }
 
+long long nowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// ------------------------------------------------------ selection (Axiom)
+std::atomic<bool> gToolsOn{true};
+std::atomic<bool> gArmed{false};
+std::atomic<bool> gHudDirty{true};
+std::atomic<bool> gStop{false};
+std::atomic<bool> gLoopRunning{false};
+std::atomic<bool> gTouchRegistered{false};
+std::mutex gSelMu;
+int gPos[2][3];
+bool gHave[2];
+int gNext = 0;
+
+struct Geo {
+  float bx = 0, by = 0, bs = 0;
+} gGeo;
+std::mutex gGeoMu;
+
+using JniBoolFn = unsigned char (*)(void *, void *);
+JniBoolFn gHudFn = nullptr, gMenuFn = nullptr, gPauseFn = nullptr;
+
+void findJni() {
+  auto find = [](const char *name) -> void * {
+    if (void *p = dlsym(RTLD_DEFAULT, name))
+      return p;
+    if (void *h = dlopen("libpreloader.so", RTLD_NOW | RTLD_NOLOAD))
+      return dlsym(h, name);
+    return nullptr;
+  };
+  gHudFn = reinterpret_cast<JniBoolFn>(find(
+      "Java_org_levimc_launcher_preloader_PreloaderInput_nativeIsHudScreenOpen"));
+  gMenuFn = reinterpret_cast<JniBoolFn>(find(
+      "Java_org_levimc_launcher_preloader_PreloaderInput_nativeIsShowingMenu"));
+  gPauseFn = reinterpret_cast<JniBoolFn>(find(
+      "Java_org_levimc_launcher_preloader_PreloaderInput_nativeIsPauseMenuOpen"));
+}
+
+bool gameHudVisible() {
+  if (!gHudFn || !gMenuFn || !gPauseFn)
+    return true;
+  return gHudFn(nullptr, nullptr) && !gMenuFn(nullptr, nullptr) &&
+         !gPauseFn(nullptr, nullptr);
+}
+
+void handleTap(void *posPtr) {
+  int pos[3];
+  if (!safeRead(posPtr, pos, sizeof(pos)))
+    return;
+  int idx;
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    idx = gNext;
+    std::memcpy(gPos[idx], pos, sizeof(pos));
+    gHave[idx] = true;
+    gNext = (gNext + 1) % 2;
+  }
+  if (idx == 1)
+    gArmed.store(false); // both points set: taps behave normally again
+  char buf[96];
+  snprintf(buf, sizeof(buf), "SELECT pos%d = (%d,%d,%d)", idx + 1, pos[0],
+           pos[1], pos[2]);
+  logLine(buf);
+  gHudDirty.store(true);
+}
+
+void toggleArmed() {
+  bool arm = !gArmed.load();
+  if (arm) {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    gHave[0] = gHave[1] = false;
+    gNext = 0;
+  }
+  gArmed.store(arm);
+  gHudDirty.store(true);
+}
+
+pl::modmenu::DrawCommand makeRect(float x, float y, float w, float h,
+                                  uint32_t color, float radius) {
+  pl::modmenu::DrawCommand d;
+  d.type = pl::modmenu::DrawCommandType::RectFilled;
+  d.x = x;
+  d.y = y;
+  d.w = w;
+  d.h = h;
+  d.x3 = radius;
+  d.color = color;
+  return d;
+}
+
+// align: 0 left, -2 center, -1 right (anchor is x)
+pl::modmenu::DrawCommand makeText(const std::string &s, float x, float baseY,
+                                  float size, uint32_t color, float align) {
+  pl::modmenu::DrawCommand d;
+  d.type = pl::modmenu::DrawCommandType::Text;
+  d.x = x;
+  d.y = baseY;
+  d.w = align;
+  d.size = size;
+  d.color = color;
+  d.text = s;
+  return d;
+}
+
+bool gHudShown = false;
+
+void renderHud() {
+  if (!gToolsOn.load() || !gameHudVisible()) {
+    if (gHudShown) {
+      pl::modmenu::submitDrawCommands(kToolsId,
+                                      std::vector<pl::modmenu::DrawCommand>{});
+      gHudShown = false;
+    }
+    std::lock_guard<std::mutex> lk(gGeoMu);
+    gGeo.bs = 0; // not touchable while hidden
+    return;
+  }
+  const auto surf = pl::modmenu::getHudSurfaceSize();
+  if (surf.width <= 0 || surf.height <= 0)
+    return;
+  const float W = static_cast<float>(surf.width);
+  const float H = static_cast<float>(surf.height);
+  const float s = std::clamp(H * 0.13f, 84.0f, 150.0f);
+  const float bx = W - s - W * 0.03f;
+  const float by = H * 0.28f;
+  {
+    std::lock_guard<std::mutex> lk(gGeoMu);
+    gGeo.bx = bx;
+    gGeo.by = by;
+    gGeo.bs = s;
+  }
+
+  bool armed = gArmed.load(), h0, h1;
+  int p0[3], p1[3], next;
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    h0 = gHave[0];
+    h1 = gHave[1];
+    std::memcpy(p0, gPos[0], sizeof(p0));
+    std::memcpy(p1, gPos[1], sizeof(p1));
+    next = gNext;
+  }
+
+  std::vector<pl::modmenu::DrawCommand> cmds;
+  const uint32_t fill = armed ? 0xE6D32F2F : 0xB0303030;
+  cmds.push_back(makeRect(bx, by, s, s, fill, s * 0.2f));
+  const char *label = armed ? (next == 0 ? "P1" : "P2") : "SEL";
+  cmds.push_back(makeText(label, bx + s * 0.5f, by + s * 0.5f + s * 0.09f,
+                          s * 0.26f, 0xFFFFFFFF, -2.0f));
+
+  const float ts = s * 0.2f;
+  float ty = by + ts;
+  auto line = [&](const std::string &t) {
+    const float w = static_cast<float>(t.size()) * ts * 0.58f + ts;
+    cmds.push_back(makeRect(bx - w - 10.0f, ty - ts * 1.05f, w, ts * 1.5f,
+                            0x99000000, ts * 0.3f));
+    cmds.push_back(makeText(t, bx - 10.0f - ts * 0.5f, ty, ts, 0xFFFFFFFF, -1.0f));
+    ty += ts * 1.7f;
+  };
+  char buf[80];
+  if (h0) {
+    snprintf(buf, sizeof(buf), "Pos1: %d, %d, %d", p0[0], p0[1], p0[2]);
+    line(buf);
+  }
+  if (h1) {
+    snprintf(buf, sizeof(buf), "Pos2: %d, %d, %d", p1[0], p1[1], p1[2]);
+    line(buf);
+    const long long n = 1ll * (std::abs(p1[0] - p0[0]) + 1) *
+                        (std::abs(p1[1] - p0[1]) + 1) *
+                        (std::abs(p1[2] - p0[2]) + 1);
+    snprintf(buf, sizeof(buf), "%lld blocks", n);
+    line(buf);
+  }
+  pl::modmenu::submitDrawCommands(kToolsId, cmds);
+  gHudShown = true;
+}
+
+void uiLoop() {
+  long long last = 0;
+  bool lastVis = false;
+  int lw = 0, lh = 0;
+  while (!gStop.load()) {
+    const bool vis = gameHudVisible();
+    const auto surf = pl::modmenu::getHudSurfaceSize();
+    const bool changed = vis != lastVis || surf.width != lw || surf.height != lh;
+    if (gHudDirty.exchange(false) || changed || nowMs() - last > 1500) {
+      renderHud();
+      last = nowMs();
+      lastVis = vis;
+      lw = surf.width;
+      lh = surf.height;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  gLoopRunning.store(false);
+}
+
+bool onTouch(const pl::input::TouchEvent &ev) {
+  static int ptr = -1;
+  if (!gToolsOn.load() || !gameHudVisible()) {
+    ptr = -1;
+    return false;
+  }
+  Geo g;
+  {
+    std::lock_guard<std::mutex> lk(gGeoMu);
+    g = gGeo;
+  }
+  if (g.bs <= 0)
+    return false;
+  const bool inside = ev.x >= g.bx && ev.x < g.bx + g.bs && ev.y >= g.by &&
+                      ev.y < g.by + g.bs;
+  switch (ev.action) {
+  case 0:
+  case 5:
+    if (ptr < 0 && inside) {
+      ptr = ev.pointerId;
+      return true;
+    }
+    break;
+  case 2:
+    if (ptr == ev.pointerId)
+      return true;
+    break;
+  case 1:
+  case 6:
+    if (ptr == ev.pointerId) {
+      ptr = -1;
+      if (inside)
+        toggleArmed();
+      return true;
+    }
+    break;
+  case 3:
+    if (ptr >= 0) {
+      ptr = -1;
+      return true;
+    }
+    break;
+  }
+  return false;
+}
+
+// ----------------------------------------- GameMode::buildBlock (tap/place)
+Fn gBuildOrig = nullptr;
+
+uintptr_t buildDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                      void *g, void *h) {
+  if (gArmed.load(std::memory_order_relaxed)) {
+    handleTap(b);
+    return 0; // swallow the tap: no block placed
+  }
+  return gBuildOrig(a, b, c, d, e, f, g, h);
+}
+
 void onToggle(std::string_view id, bool enabled) {
   if (id == kModuleId) {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(enabled);
     saveState(enabled);
-  } else if (id == kLogId) {
-    gLog.store(enabled);
-  } else if (id == kCmdLogId) {
-    gCmdLog.store(enabled);
   } else if (id == kToolsId) {
-    gToolsOn = enabled;
+    gToolsOn.store(enabled);
     if (!enabled)
       gArmed.store(false);
-    updateHud();
+    gHudDirty.store(true);
   }
-}
-
-std::vector<unsigned char> solid(unsigned char r, unsigned char g,
-                                 unsigned char b, unsigned char a) {
-  std::vector<unsigned char> px(8 * 8 * 4);
-  for (size_t i = 0; i < 64; ++i) {
-    px[i * 4] = r;
-    px[i * 4 + 1] = g;
-    px[i * 4 + 2] = b;
-    px[i * 4 + 3] = a;
-  }
-  return px;
 }
 
 } // namespace
@@ -430,6 +474,24 @@ public:
       log.info("libminecraftpe.so not found");
       return false;
     }
+    {
+      const char *cands[] = {"/sdcard/Download/axiom_log3.txt",
+                             "/sdcard/axiom_log3.txt"};
+      gLogPath.clear();
+      for (const char *c : cands) {
+        std::ofstream t(c, std::ios::app);
+        if (t.good()) {
+          gLogPath = c;
+          break;
+        }
+      }
+      if (gLogPath.empty()) {
+        std::string d = filesDir();
+        gLogPath = d.empty() ? "/dev/null" : d + "axiom_log3.txt";
+      }
+    }
+    logLine("--- axiom v0.3 start --- path=" + gLogPath);
+
     const bool savedOn = loadState();
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(savedOn);
@@ -456,63 +518,21 @@ public:
     if (ok == 0)
       return false;
 
-    // ---- log file location (new name: avoids old file owned by another app)
+    // ---- tap hook
     {
-      const char *cands[] = {"/sdcard/Download/axiom_log2.txt",
-                             "/sdcard/axiom_log2.txt"};
-      gLogPath.clear();
-      for (const char *c : cands) {
-        std::ofstream t(c, std::ios::app);
-        if (t.good()) {
-          gLogPath = c;
-          break;
-        }
+      auto *addr = reinterpret_cast<void *>(base + kBuildRva);
+      if (matchHex(addr, kBuildHex)) {
+        mBuildHook = pl::memory::HookHandle(
+            addr, reinterpret_cast<void *>(&buildDetour),
+            reinterpret_cast<void **>(&gBuildOrig),
+            pl::memory::HookPriority::Normal);
       }
-      if (gLogPath.empty()) {
-        std::string d = filesDir();
-        gLogPath = d.empty() ? "/dev/null" : d + "axiom_log2.txt";
-      }
+      mTapOk = mBuildHook.installed();
     }
-    logLine("--- axiom log start (v0.2) --- path=" + gLogPath);
-
-    // ---- GameMode hooks
-    static const auto labDetours =
-        makeLabDetours(std::make_index_sequence<kLabCount>{});
-    int labOk = 0;
-    for (size_t i = 0; i < kLabCount; ++i) {
-      auto *addr = reinterpret_cast<void *>(base + kLab[i].rva);
-      if (!matchHex(addr, kLab[i].hex))
-        continue;
-      mLabHooks[i] = pl::memory::HookHandle(
-          addr, labDetours[i], reinterpret_cast<void **>(&gLabOrig[i]),
-          pl::memory::HookPriority::Normal);
-      if (mLabHooks[i].installed())
-        ++labOk;
-    }
-    log.info("{}/{} input hooks installed", labOk, static_cast<int>(kLabCount));
-    mTapOk = mLabHooks[kBuildIdx].installed();
-
-    // ---- ScreenModel hooks (command test)
-    static const auto smDetours =
-        makeSmDetours(std::make_index_sequence<kSmCount>{});
-    int smOk = 0;
-    for (size_t i = 0; i < kSmCount; ++i) {
-      auto *addr = reinterpret_cast<void *>(base + kSm[i].rva);
-      if (!matchHex(addr, kSm[i].hex))
-        continue;
-      mSmHooks[i] = pl::memory::HookHandle(
-          addr, smDetours[i], reinterpret_cast<void **>(&gSmOrig[i]),
-          pl::memory::HookPriority::Normal);
-      if (mSmHooks[i].installed())
-        ++smOk;
-    }
-    log.info("{}/{} screen model hooks installed", smOk,
-             static_cast<int>(kSmCount));
-
-    logLine("hooks: noupdates=" + std::to_string(ok) + " gamemode=" +
-            std::to_string(labOk) + " screenmodel=" + std::to_string(smOk) +
+    logLine("hooks: noupdates=" + std::to_string(ok) +
             " tapHook=" + std::string(mTapOk ? "yes" : "no"));
 
+    // ---- menu
     logLine("step: registering No Updates");
     bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
                  .modId(mSelf.getId())
@@ -527,51 +547,25 @@ public:
       logLine("step: registering Axiom Tools");
       r &= pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
                .modId(mSelf.getId())
-               .description("Select button: tap it, then tap two blocks "
+               .description("HUD button SEL: tap it, then tap two blocks "
                             "(Pos1, Pos2).")
                .defaultEnabled(true)
                .onToggle(onToggle)
                .registerModule();
       logLine("step: Axiom Tools done");
-    }
-    if (labOk > 0) {
-      logLine("step: registering Input Log");
-      r &= pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
-               .modId(mSelf.getId())
-               .description("Test: block taps to the log file")
-               .defaultEnabled(false)
-               .onToggle(onToggle)
-               .registerModule();
-      logLine("step: Input Log done");
-    }
-    if (smOk > 0) {
-      logLine("step: registering Command Log");
-      r &= pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
-               .modId(mSelf.getId())
-               .description("Test: type in chat while on; strings go to the "
-                            "log file")
-               .defaultEnabled(false)
-               .onToggle(onToggle)
-               .registerModule();
-      logLine("step: Command Log done");
-    }
-    if (mTapOk) {
-      // button last: if the launcher rejects it, everything else exists
-      logLine("step: registering images");
-      pl::modmenu::registerImage("axiom.red", solid(230, 40, 40, 230), 8, 8);
-      pl::modmenu::registerImage("axiom.gray", solid(90, 90, 90, 140), 8, 8);
-      logLine("step: registering Select button");
-      r &= pl::modmenu::ButtonBuilder(kButtonId, "Select")
-               .modId(mSelf.getId())
-               .moduleId(kToolsId)
-               .label("Select")
-               .androidKeyCode(0)
-               .behavior(pl::modmenu::ButtonBehavior::Click)
-               .onEvent(onButton)
-               .registerButton();
-      logLine("step: Select button done");
-      updateHud();
-      logLine("step: HUD done");
+
+      findJni();
+      if (!gTouchRegistered.exchange(true)) {
+        pl::input::registerTouchCallback(
+            [](const pl::input::TouchEvent &ev) { return onTouch(ev); });
+        logLine("step: touch callback registered");
+      }
+      gStop.store(false);
+      gToolsOn.store(true);
+      if (!gLoopRunning.exchange(true))
+        std::thread([] { uiLoop(); }).detach();
+      gHudDirty.store(true);
+      logLine("step: HUD loop started");
     }
     return r;
   }
@@ -580,17 +574,11 @@ public:
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(false);
     gArmed.store(false);
-    gLog.store(false);
-    gCmdLog.store(false);
-    pl::modmenu::unregisterButton(kButtonId);
+    gToolsOn.store(false);
+    gStop.store(true);
     pl::modmenu::unregisterModule(kToolsId);
     pl::modmenu::unregisterModule(kModuleId);
-    pl::modmenu::unregisterModule(kLogId);
-    pl::modmenu::unregisterModule(kCmdLogId);
-    for (auto &h : mSmHooks)
-      h.reset();
-    for (auto &h : mLabHooks)
-      h.reset();
+    mBuildHook.reset();
     for (auto &h : mHooks)
       h.reset();
     return true;
@@ -602,8 +590,7 @@ private:
   ll::mod::NativeMod &mSelf;
   bool mTapOk = false;
   std::array<pl::memory::HookHandle, kCount> mHooks;
-  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
-  std::array<pl::memory::HookHandle, kSmCount> mSmHooks;
+  pl::memory::HookHandle mBuildHook;
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
