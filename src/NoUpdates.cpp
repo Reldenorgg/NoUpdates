@@ -208,19 +208,37 @@ std::mutex gGeoMu;
 using JniBoolFn = unsigned char (*)(void *, void *);
 JniBoolFn gHudFn = nullptr, gMenuFn = nullptr, gPauseFn = nullptr;
 
+void *findSym(const char *name) {
+  if (void *p = dlsym(RTLD_DEFAULT, name))
+    return p;
+  if (void *h = dlopen("libpreloader.so", RTLD_NOW | RTLD_NOLOAD))
+    return dlsym(h, name);
+  return nullptr;
+}
+
+// pl::modmenu::getHudSurfaceSize() returns two floats (width, height).
+// Not declared in SDK 0.2.2, so it is looked up in the launcher at runtime.
+struct HudSize {
+  float width;
+  float height;
+};
+using HudSizeFn = HudSize (*)();
+HudSizeFn gSizeFn = nullptr;
+
+HudSize hudSize() {
+  if (!gSizeFn)
+    return HudSize{0.0f, 0.0f};
+  return gSizeFn();
+}
+
 void findJni() {
-  auto find = [](const char *name) -> void * {
-    if (void *p = dlsym(RTLD_DEFAULT, name))
-      return p;
-    if (void *h = dlopen("libpreloader.so", RTLD_NOW | RTLD_NOLOAD))
-      return dlsym(h, name);
-    return nullptr;
-  };
-  gHudFn = reinterpret_cast<JniBoolFn>(find(
+  gSizeFn = reinterpret_cast<HudSizeFn>(
+      findSym("_ZN2pl7modmenu17getHudSurfaceSizeEv"));
+  gHudFn = reinterpret_cast<JniBoolFn>(findSym(
       "Java_org_levimc_launcher_preloader_PreloaderInput_nativeIsHudScreenOpen"));
-  gMenuFn = reinterpret_cast<JniBoolFn>(find(
+  gMenuFn = reinterpret_cast<JniBoolFn>(findSym(
       "Java_org_levimc_launcher_preloader_PreloaderInput_nativeIsShowingMenu"));
-  gPauseFn = reinterpret_cast<JniBoolFn>(find(
+  gPauseFn = reinterpret_cast<JniBoolFn>(findSym(
       "Java_org_levimc_launcher_preloader_PreloaderInput_nativeIsPauseMenuOpen"));
 }
 
@@ -303,11 +321,11 @@ void renderHud() {
     gGeo.bs = 0; // not touchable while hidden
     return;
   }
-  const auto surf = pl::modmenu::getHudSurfaceSize();
-  if (surf.width <= 0 || surf.height <= 0)
+  const HudSize surf = hudSize();
+  if (surf.width <= 0.0f || surf.height <= 0.0f)
     return;
-  const float W = static_cast<float>(surf.width);
-  const float H = static_cast<float>(surf.height);
+  const float W = surf.width;
+  const float H = surf.height;
   const float s = std::clamp(H * 0.13f, 84.0f, 150.0f);
   const float bx = W - s - W * 0.03f;
   const float by = H * 0.28f;
@@ -366,10 +384,10 @@ void renderHud() {
 void uiLoop() {
   long long last = 0;
   bool lastVis = false;
-  int lw = 0, lh = 0;
+  float lw = 0, lh = 0;
   while (!gStop.load()) {
     const bool vis = gameHudVisible();
-    const auto surf = pl::modmenu::getHudSurfaceSize();
+    const HudSize surf = hudSize();
     const bool changed = vis != lastVis || surf.width != lw || surf.height != lh;
     if (gHudDirty.exchange(false) || changed || nowMs() - last > 1500) {
       renderHud();
@@ -555,6 +573,8 @@ public:
       logLine("step: Axiom Tools done");
 
       findJni();
+      logLine(std::string("hud size fn: ") + (gSizeFn ? "found" : "MISSING") +
+              ", hud fn: " + (gHudFn ? "found" : "missing"));
       if (!gTouchRegistered.exchange(true)) {
         pl::input::registerTouchCallback(
             [](const pl::input::TouchEvent &ev) { return onTouch(ev); });
