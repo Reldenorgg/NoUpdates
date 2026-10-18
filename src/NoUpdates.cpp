@@ -513,108 +513,51 @@ public:
             std::to_string(labOk) + " screenmodel=" + std::to_string(smOk) +
             " tapHook=" + std::string(mTapOk ? "yes" : "no"));
 
-    bool r = true;
-    auto reg = [&](const char *what, auto &&fn) {
-      bool res = false;
-      try {
-        res = fn();
-        logLine(std::string("register ") + what + (res ? ": ok" : ": FAILED"));
-      } catch (...) {
-        logLine(std::string("register ") + what + ": EXCEPTION");
-      }
-      r &= res;
-    };
+    logLine("step: registering No Updates");
+    bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
+                 .modId(mSelf.getId())
+                 .description("Freezes block updates: sand, gravel, water, "
+                              "lava, redstone, plants, fire, ladders...")
+                 .defaultEnabled(savedOn)
+                 .onToggle(onToggle)
+                 .registerModule();
+    logLine("step: No Updates done");
 
-    reg("No Updates", [&] {
-      return pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
-          .modId(mSelf.getId())
-          .description("Freezes block updates: sand, gravel, water, lava, "
-                       "redstone, plants, fire, ladders...")
-          .defaultEnabled(savedOn)
-          .onToggle(onToggle)
-          .registerModule();
-    });
-    if (labOk > 0)
-      reg("Input Log", [&] {
-        return pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
-            .modId(mSelf.getId())
-            .description("Test: block taps to the log file")
-            .defaultEnabled(false)
-            .onToggle(onToggle)
-            .registerModule();
-      });
-    if (smOk > 0)
-      reg("Command Log", [&] {
-        return pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
-            .modId(mSelf.getId())
-            .description("Test: type in chat while on; strings go to the log")
-            .defaultEnabled(false)
-            .onToggle(onToggle)
-            .registerModule();
-      });
     if (mTapOk) {
-      reg("images", [&] {
-        bool a1 = pl::modmenu::registerImage("axiom.red",
-                                             solid(230, 40, 40, 230), 8, 8);
-        bool a2 = pl::modmenu::registerImage("axiom.gray",
-                                             solid(90, 90, 90, 140), 8, 8);
-        return a1 && a2;
-      });
-      reg("Axiom Tools", [&] {
-        return pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
-            .modId(mSelf.getId())
-            .description("Select button: tap it, then tap two blocks "
-                         "(Pos1, Pos2).")
-            .defaultEnabled(true)
-            .onToggle(onToggle)
-            .registerModule();
-      });
-      reg("Select button", [&] {
-        return pl::modmenu::ButtonBuilder(kButtonId, "Select")
-            .modId(mSelf.getId())
-            .moduleId(kToolsId)
-            .label("Select")
-            .androidKeyCode(0)
-            .behavior(pl::modmenu::ButtonBehavior::Click)
-            .onEvent(onButton)
-            .registerButton();
-      });
-      reg("HUD", [&] {
-        updateHud();
-        return true;
-      });
+      logLine("step: registering Axiom Tools");
+      r &= pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
+               .modId(mSelf.getId())
+               .description("Select button: tap it, then tap two blocks "
+                            "(Pos1, Pos2).")
+               .defaultEnabled(true)
+               .onToggle(onToggle)
+               .registerModule();
+      logLine("step: Axiom Tools done");
     }
-    return r;
-  }
-
-  bool disable() {
-    for (int i = 0; i < 3; ++i)
-      gFrozen[i].store(false);
-    gArmed.store(false);
-    gLog.store(false);
-    gCmdLog.store(false);
-    pl::modmenu::unregisterButton(kButtonId);
-    pl::modmenu::unregisterModule(kToolsId);
-    pl::modmenu::unregisterModule(kModuleId);
-    pl::modmenu::unregisterModule(kLogId);
-    pl::modmenu::unregisterModule(kCmdLogId);
-    for (auto &h : mSmHooks)
-      h.reset();
-    for (auto &h : mLabHooks)
-      h.reset();
-    for (auto &h : mHooks)
-      h.reset();
-    return true;
-  }
-
-  bool unload() { return true; }
-
-private:
-  ll::mod::NativeMod &mSelf;
-  bool mTapOk = false;
-  std::array<pl::memory::HookHandle, kCount> mHooks;
-  std::array<pl::memory::HookHandle, kLabCount> mLabHooks;
-  std::array<pl::memory::HookHandle, kSmCount> mSmHooks;
-};
-
-PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
+    if (labOk > 0) {
+      logLine("step: registering Input Log");
+      r &= pl::modmenu::ModuleBuilder(kLogId, "Input Log (test)")
+               .modId(mSelf.getId())
+               .description("Test: block taps to the log file")
+               .defaultEnabled(false)
+               .onToggle(onToggle)
+               .registerModule();
+      logLine("step: Input Log done");
+    }
+    if (smOk > 0) {
+      logLine("step: registering Command Log");
+      r &= pl::modmenu::ModuleBuilder(kCmdLogId, "Command Log (test)")
+               .modId(mSelf.getId())
+               .description("Test: type in chat while on; strings go to the "
+                            "log file")
+               .defaultEnabled(false)
+               .onToggle(onToggle)
+               .registerModule();
+      logLine("step: Command Log done");
+    }
+    if (mTapOk) {
+      // button last: if the launcher rejects it, everything else exists
+      logLine("step: registering images");
+      pl::modmenu::registerImage("axiom.red", solid(230, 40, 40, 230), 8, 8);
+      pl::modmenu::registerImage("axiom.gray", solid(90, 90, 90, 140), 8, 8);
+      logLine("step: registe
