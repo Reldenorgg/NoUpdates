@@ -9,6 +9,7 @@
 #include <pl/memory/Hook.hpp>
 
 #include <dlfcn.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -122,6 +124,7 @@ bool matchHex(const void *p, const char *hex) {
   return true;
 }
 
+uintptr_t gBase = 0;
 std::string gLogPath = "/dev/null";
 void logLine(const std::string &line) {
   std::ofstream f(gLogPath, std::ios::app);
@@ -449,6 +452,8 @@ bool onTouch(const pl::input::TouchEvent &ev) {
 
 // ----------------------------------------- GameMode::buildBlock (tap/place)
 Fn gBuildOrig = nullptr;
+std::atomic<bool> gWorldProbe{false};
+void probeGameMode(void *gm, const char *tag);
 
 uintptr_t buildDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                       void *g, void *h) {
@@ -456,7 +461,144 @@ uintptr_t buildDetour(void *a, void *b, void *c, void *d, void *e, void *f,
     handleTap(b);
     return 0; // swallow the tap: no block placed
   }
+  if (gWorldProbe.load(std::memory_order_relaxed))
+    probeGameMode(a, "build");
   return gBuildOrig(a, b, c, d, e, f, g, h);
+}
+
+// ---------------------------------------- world probe E0/E1 (read-only)
+// Goal: find out whether a client and a server GameMode/BlockSource exist in
+// this process, on which threads, and whether getBlock agrees on both.
+constexpr uintptr_t kGmTickRva = 0xf8a38f0; // GameMode vtable slot 10
+constexpr const char *kGmTickHex = "fd7bbea9f30b00f9fd030091f30300aa";
+constexpr uintptr_t kGmDestroyRva = 0xf8a03ac; // GameMode vtable slot 3
+constexpr const char *kGmDestroyHex = "ff0302d1fd7b04a9f85f05a9f65706a9";
+constexpr uintptr_t kLpTickRva = 0xaac7dd8; // LocalPlayer vtable slot 25
+constexpr const char *kLpTickHex = "e80f19fcfd7b01a9fc6f02a9fa6703a9";
+constexpr uintptr_t kGetBlockRva = 0xfb91918; // BlockSource::getBlock (3rd party)
+constexpr uintptr_t kGmPlayerOff = 0x8;       // GameMode -> Player
+constexpr uintptr_t kActorDimOff = 448;       // Actor -> Dimension
+constexpr uintptr_t kDimBsOff = 208;          // Dimension -> BlockSource
+constexpr const char *kProbeId = "axiom.worldprobe";
+
+// BlockSource::getBlock prologue (-1 = wildcard)
+constexpr int kGetBlockPat[] = {
+    -1, -1, -1, 0xD1, -1, -1, -1, 0xA9, -1, -1, -1, 0xA9, -1, -1, -1, 0xA9,
+    -1, -1, -1, 0x91, 0x56, 0xD0, 0x3B, 0xD5, -1, -1, -1, 0xF9, -1, -1, -1,
+    0xF9, -1, -1, -1, 0xB9, -1, -1, -1, 0x79, 0x1F, 0x01, 0x09, 0x6B};
+
+bool matchPattern(const void *p, const int *pat, size_t n) {
+  const unsigned char *b = static_cast<const unsigned char *>(p);
+  for (size_t i = 0; i < n; ++i)
+    if (pat[i] >= 0 && b[i] != pat[i])
+      return false;
+  return true;
+}
+
+using GetBlockFn = void *(*)(void *region, const int *pos);
+
+std::atomic<int> gWorldCount{0};
+std::atomic<uintptr_t> gLocalPlayer{0};
+GetBlockFn gGetBlock = nullptr;
+Fn gGmTickOrig = nullptr;
+Fn gGmDestroyOrig = nullptr;
+Fn gLpTickOrig = nullptr;
+
+long tid() { return syscall(SYS_gettid); }
+
+bool rdp(uintptr_t addr, uintptr_t &out) {
+  return addr > 0x10000 && safeRead(reinterpret_cast<void *>(addr), &out, 8);
+}
+
+uintptr_t vptrRva(uintptr_t obj) {
+  uintptr_t vp = 0;
+  if (!rdp(obj, vp) || vp < gBase)
+    return 0;
+  return vp - gBase;
+}
+
+void probeGameMode(void *gm, const char *tag) {
+  struct Seen {
+    uintptr_t gm;
+    int n;
+  };
+  static Seen seen[16];
+  static std::mutex mu;
+  int n;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    Seen *slot = nullptr;
+    for (auto &s : seen)
+      if (s.gm == reinterpret_cast<uintptr_t>(gm)) {
+        slot = &s;
+        break;
+      }
+    if (!slot)
+      for (auto &s : seen)
+        if (!s.gm) {
+          s.gm = reinterpret_cast<uintptr_t>(gm);
+          slot = &s;
+          break;
+        }
+    if (!slot)
+      return;
+    n = ++slot->n;
+  }
+  if (n > 3 || gWorldCount.load() > 80)
+    return;
+  uintptr_t player = 0, dim = 0, bs = 0;
+  rdp(reinterpret_cast<uintptr_t>(gm) + kGmPlayerOff, player);
+  if (player)
+    rdp(player + kActorDimOff, dim);
+  if (dim)
+    rdp(dim + kDimBsOff, bs);
+  void *gb = nullptr;
+  uintptr_t gbVp = 0;
+  bool have;
+  int pos[3];
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    have = gHave[0];
+    std::memcpy(pos, gPos[0], sizeof(pos));
+  }
+  if (gGetBlock && bs && have) {
+    gb = gGetBlock(reinterpret_cast<void *>(bs), pos);
+    if (gb)
+      gbVp = vptrRva(reinterpret_cast<uintptr_t>(gb));
+  }
+  char buf[420];
+  snprintf(buf, sizeof(buf),
+           "E0 %s #%d gm=%p tid=%ld player=%p local=%d plVp=0x%lx dim=%p bs=%p "
+           "bsVp=0x%lx pos1=%d,%d,%d getBlock=%p blkVp=0x%lx",
+           tag, n, gm, tid(), reinterpret_cast<void *>(player),
+           player && player == gLocalPlayer.load() ? 1 : 0,
+           static_cast<unsigned long>(vptrRva(player)),
+           reinterpret_cast<void *>(dim), reinterpret_cast<void *>(bs),
+           static_cast<unsigned long>(vptrRva(bs)), have ? pos[0] : 0,
+           have ? pos[1] : 0, have ? pos[2] : 0, gb,
+           static_cast<unsigned long>(gbVp));
+  gWorldCount.fetch_add(1);
+  logLine(buf);
+}
+
+uintptr_t gmTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                       void *g, void *h) {
+  if (gWorldProbe.load(std::memory_order_relaxed))
+    probeGameMode(a, "tick");
+  return gGmTickOrig(a, b, c, d, e, f, g, h);
+}
+
+uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                          void *g, void *h) {
+  if (gWorldProbe.load(std::memory_order_relaxed))
+    probeGameMode(a, "destroy");
+  return gGmDestroyOrig(a, b, c, d, e, f, g, h);
+}
+
+uintptr_t lpTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                       void *g, void *h) {
+  gLocalPlayer.store(reinterpret_cast<uintptr_t>(a), std::memory_order_relaxed);
+  return gLpTickOrig(a, b, c, d, e, f, g, h);
 }
 
 void onToggle(std::string_view id, bool enabled) {
@@ -464,6 +606,8 @@ void onToggle(std::string_view id, bool enabled) {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(enabled);
     saveState(enabled);
+  } else if (id == kProbeId) {
+    gWorldProbe.store(enabled);
   } else if (id == kToolsId) {
     gToolsOn.store(enabled);
     if (!enabled)
@@ -510,6 +654,7 @@ public:
     }
     logLine("--- axiom v0.3 start --- path=" + gLogPath);
 
+    gBase = base;
     const bool savedOn = loadState();
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(savedOn);
@@ -587,6 +732,48 @@ public:
       gHudDirty.store(true);
       logLine("step: HUD loop started");
     }
+
+    // ---- world probe hooks + module (read-only test)
+    {
+      auto install = [&](uintptr_t rva, const char *hex, void *detour, Fn *orig,
+                         pl::memory::HookHandle &h) {
+        auto *addr = reinterpret_cast<void *>(base + rva);
+        if (!matchHex(addr, hex))
+          return false;
+        h = pl::memory::HookHandle(addr, detour,
+                                   reinterpret_cast<void **>(orig),
+                                   pl::memory::HookPriority::Normal);
+        return h.installed();
+      };
+      const bool t1 = install(kGmTickRva, kGmTickHex,
+                              reinterpret_cast<void *>(&gmTickDetour),
+                              &gGmTickOrig, mGmTickHook);
+      const bool t2 = install(kGmDestroyRva, kGmDestroyHex,
+                              reinterpret_cast<void *>(&gmDestroyDetour),
+                              &gGmDestroyOrig, mGmDestroyHook);
+      const bool t3 = install(kLpTickRva, kLpTickHex,
+                              reinterpret_cast<void *>(&lpTickDetour),
+                              &gLpTickOrig, mLpTickHook);
+      auto *gbAddr = reinterpret_cast<void *>(base + kGetBlockRva);
+      const bool gbOk = matchPattern(gbAddr, kGetBlockPat,
+                                     sizeof(kGetBlockPat) / sizeof(int));
+      gGetBlock = gbOk ? reinterpret_cast<GetBlockFn>(gbAddr) : nullptr;
+      logLine("world probe hooks: gmTick=" + std::to_string(t1) +
+              " gmDestroy=" + std::to_string(t2) +
+              " lpTick=" + std::to_string(t3) +
+              " getBlockSig=" + std::to_string(gbOk));
+      if (t1) {
+        logLine("step: registering World Probe");
+        r &= pl::modmenu::ModuleBuilder(kProbeId, "World Probe (test)")
+                 .modId(mSelf.getId())
+                 .description("Test (read-only): turn on, tap a block with "
+                              "SEL (Pos1), walk and break one block, turn off.")
+                 .defaultEnabled(false)
+                 .onToggle(onToggle)
+                 .registerModule();
+        logLine("step: World Probe done");
+      }
+    }
     return r;
   }
 
@@ -596,9 +783,14 @@ public:
     gArmed.store(false);
     gToolsOn.store(false);
     gStop.store(true);
+    gWorldProbe.store(false);
+    pl::modmenu::unregisterModule(kProbeId);
     pl::modmenu::unregisterModule(kToolsId);
     pl::modmenu::unregisterModule(kModuleId);
     mBuildHook.reset();
+    mGmTickHook.reset();
+    mGmDestroyHook.reset();
+    mLpTickHook.reset();
     for (auto &h : mHooks)
       h.reset();
     return true;
@@ -611,6 +803,9 @@ private:
   bool mTapOk = false;
   std::array<pl::memory::HookHandle, kCount> mHooks;
   pl::memory::HookHandle mBuildHook;
+  pl::memory::HookHandle mGmTickHook;
+  pl::memory::HookHandle mGmDestroyHook;
+  pl::memory::HookHandle mLpTickHook;
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
