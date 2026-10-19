@@ -90,6 +90,11 @@ constexpr const char *kBuildHex = "ffc304d1fd7b0da9fc7300f9fa670fa9";
 
 using Fn = uintptr_t (*)(void *, void *, void *, void *, void *, void *,
                          void *, void *);
+#if defined(__clang__)
+#define AX_NOSP __attribute__((no_stack_protector))
+#else
+#define AX_NOSP
+#endif
 
 std::atomic<bool> gFrozen[3];
 Fn gOrig[kCount]{};
@@ -500,6 +505,8 @@ bool matchPattern(const void *p, const int *pat, size_t n) {
 using GetBlockFn = void *(*)(void *region, const int *pos);
 
 std::atomic<int> gWorldCount{0};
+uintptr_t gBaseForProbe = 0;
+std::function<void()> gInstallProbe;
 std::atomic<uintptr_t> gLocalPlayer{0};
 GetBlockFn gGetBlock = nullptr;
 Fn gGmTickOrig = nullptr;
@@ -711,7 +718,7 @@ inline long rawTid() { return 0; }
 #endif
 
 template <size_t I>
-uintptr_t traceDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+AX_NOSP uintptr_t traceDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                       void *g, void *h) {
   if (__builtin_expect(gWin.load(std::memory_order_relaxed), 0)) {
     const uint32_t n = gRingN.fetch_add(1, std::memory_order_relaxed);
@@ -797,7 +804,7 @@ void probeServerPlayer(void *player) {
   logLine(buf);
 }
 
-uintptr_t spTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+AX_NOSP uintptr_t spTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                        void *g, void *h) {
   if (gWorldProbe.load(std::memory_order_relaxed))
     probeServerPlayer(a);
@@ -849,6 +856,8 @@ void onToggle(std::string_view id, bool enabled) {
       gFrozen[i].store(enabled);
     saveState(enabled);
   } else if (id == kProbeId) {
+    if (enabled && gInstallProbe)
+      gInstallProbe(); // heavy hooks only when the probe is turned on
     gWorldProbe.store(enabled);
   } else if (id == kToolsId) {
     gToolsOn.store(enabled);
@@ -894,7 +903,8 @@ public:
         gLogPath = d.empty() ? "/dev/null" : d + "axiom_log3.txt";
       }
     }
-    logLine("--- axiom v0.3 start --- path=" + gLogPath);
+    logLine("--- axiom v0.4 start --- path=" + gLogPath);
+    gInstallProbe = [this] { installProbeHooks(); };
 
     gBase = base;
     const bool savedOn = loadState();
@@ -996,25 +1006,8 @@ public:
       const bool t3 = install(kLpTickRva, kLpTickHex,
                               reinterpret_cast<void *>(&lpTickDetour),
                               &gLpTickOrig, mLpTickHook);
-      const bool t4 = install(kSpTickRva, kSpTickHex,
-                              reinterpret_cast<void *>(&spTickDetour),
-                              &gSpTickOrig, mSpTickHook);
       gPid = getpid();
-      static const auto trD =
-          makeTraceDetours(std::make_index_sequence<kTraceCount>{});
-      int trOk = 0;
-      for (size_t i = 0; i < kTraceCount; ++i) {
-        auto *taddr = reinterpret_cast<void *>(base + kTrace[i].rva);
-        if (!matchHex(taddr, kTrace[i].hex))
-          continue;
-        mTraceHooks[i] = pl::memory::HookHandle(
-            taddr, trD[i], reinterpret_cast<void **>(&gTraceOrig[i]),
-            pl::memory::HookPriority::Normal);
-        if (mTraceHooks[i].installed())
-          ++trOk;
-      }
-      logLine("trace hooks: " + std::to_string(trOk) + "/" +
-              std::to_string(kTraceCount) + " spTick=" + std::to_string(t4));
+      gBaseForProbe = base;
       auto *gbAddr = reinterpret_cast<void *>(base + kGetBlockRva);
       const bool gbOk = matchPattern(gbAddr, kGetBlockPat,
                                      sizeof(kGetBlockPat) / sizeof(int));
@@ -1038,7 +1031,44 @@ public:
     return r;
   }
 
+  void installProbeHooks() {
+    std::lock_guard<std::mutex> lk(mProbeMu);
+    if (mProbeInstalled)
+      return;
+    mProbeInstalled = true;
+    const uintptr_t base = gBaseForProbe;
+    logLine("probe: installing ServerPlayer tick hook");
+    {
+      auto *addr = reinterpret_cast<void *>(base + kSpTickRva);
+      if (matchHex(addr, kSpTickHex)) {
+        mSpTickHook = pl::memory::HookHandle(
+            addr, reinterpret_cast<void *>(&spTickDetour),
+            reinterpret_cast<void **>(&gSpTickOrig),
+            pl::memory::HookPriority::Normal);
+      }
+      logLine(std::string("probe: spTick installed=") +
+              (mSpTickHook.installed() ? "1" : "0"));
+    }
+    logLine("probe: installing trace hooks");
+    static const auto trD =
+        makeTraceDetours(std::make_index_sequence<kTraceCount>{});
+    int trOk = 0;
+    for (size_t i = 0; i < kTraceCount; ++i) {
+      auto *taddr = reinterpret_cast<void *>(base + kTrace[i].rva);
+      if (!matchHex(taddr, kTrace[i].hex))
+        continue;
+      mTraceHooks[i] = pl::memory::HookHandle(
+          taddr, trD[i], reinterpret_cast<void **>(&gTraceOrig[i]),
+          pl::memory::HookPriority::Normal);
+      if (mTraceHooks[i].installed())
+        ++trOk;
+    }
+    logLine("probe: trace hooks installed " + std::to_string(trOk) + "/" +
+            std::to_string(kTraceCount));
+  }
+
   bool disable() {
+    gInstallProbe = nullptr;
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(false);
     gArmed.store(false);
@@ -1071,6 +1101,8 @@ private:
   pl::memory::HookHandle mGmDestroyHook;
   pl::memory::HookHandle mLpTickHook;
   pl::memory::HookHandle mSpTickHook;
+  std::mutex mProbeMu;
+  bool mProbeInstalled = false;
   std::array<pl::memory::HookHandle, kTraceCount> mTraceHooks;
 };
 
