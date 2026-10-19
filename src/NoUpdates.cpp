@@ -25,6 +25,8 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <set>
+#include <tuple>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -581,6 +583,227 @@ void probeGameMode(void *gm, const char *tag) {
   logLine(buf);
 }
 
+// ---- server-thread tracer: records BlockSource / destroy callees only
+// while the server GameMode::destroyBlock is running (read-only).
+struct TraceTarget {
+  uintptr_t rva;
+  const char *hex;
+  const char *name;
+};
+constexpr TraceTarget kTrace[] = {
+    {0xfb8e8bc, "fd7bbea9f44f01a9fd03009108a44aa9", "BS0"},
+    {0xfb8e9c0, "fd7bbea9f30b00f9fd030091f30300aa", "BS1"},
+    {0xfb91918, "ff0301d1fd7b01a9f65702a9f44f03a9", "BS2"},
+    {0xfb91ad8, "ff0301d1fd7b01a9f65702a9f44f03a9", "BS4"},
+    {0xfb91b58, "ff0301d1fd7b01a9f65702a9f44f03a9", "BS5"},
+    {0xfb91c18, "fd7bbda9f65701a9f44f02a9fd030091", "BS6"},
+    {0xfb91cf0, "fd7bbea9f30b00f9fd030091080040f9", "BS7"},
+    {0xfb99330, "ff8303d1fd7b0aa9f75b00f9f6570ca9", "BS9"},
+    {0xfb9a468, "ff8301d1fd7b02a9f71b00f9f65704a9", "BS10"},
+    {0xfb9a55c, "ff4302d1fd7b03a9fc6f04a9fa6705a9", "BS11"},
+    {0xfb93464, "fd7bbfa9fd030091080040f9080940f9", "BS12"},
+    {0xfb9bd44, "ff0301d1fd7b02a9f31b00f9fd830091", "BS13"},
+    {0xfb92c10, "ff4301d1fd7b02a9f51b00f9f44f04a9", "BS14"},
+    {0xfb90f34, "fd7bbea9f30b00f9fd030091080040f9", "BS15"},
+    {0xfb90f80, "ffc301d1fd7b01a9fc6f02a9fa6703a9", "BS16"},
+    {0xfb911ec, "ffc301d1fd7b01a9fc6f02a9fa6703a9", "BS17"},
+    {0xfb910d8, "ff4302d1fd7b03a9fc6f04a9fa6705a9", "BS18"},
+    {0xfb96d78, "ff8304d1ea5300fde9230b6dfd7b0ca9", "BS21"},
+    {0xfb973d4, "ff4301d1fd7b03a9f44f04a9fdc30091", "BS22"},
+    {0xfb97b5c, "ff4301d1fd7b03a9f44f04a9fdc30091", "BS23"},
+    {0xfb98514, "ff4304d1eb2b096de9230a6dfd7b0ba9", "BS24"},
+    {0xfb92f9c, "fd7bbda9f50b00f9f44f02a9fd030091", "BS25"},
+    {0xfb9c244, "fd7bbda9f50b00f9f44f02a9fd030091", "BS26"},
+    {0xfb90b24, "fd7bbba9f90b00f9f85f02a9f65703a9", "BS27"},
+    {0xfb8f22c, "fd7bbda9f50b00f9f44f02a9fd030091", "BS28"},
+    {0xfb94dcc, "ffc301d1fd7b05a9f33300f9fd430191", "BS29"},
+    {0xfb95848, "ff8305d1fd7b10a9fc6f11a9fa6712a9", "BS30"},
+    {0xfb91de0, "ff4301d1fd7b02a9f51b00f9f44f04a9", "BS31"},
+    {0xfb9274c, "ff0302d1fd7b02a9fb1b00f9fa6704a9", "BS32"},
+    {0xfb92bb4, "fd7bbda9f50b00f9f44f02a9fd030091", "BS33"},
+    {0xfb9af3c, "ffc300d1fd7b01a9f44f02a9fd430091", "BS39"},
+    {0xfb8f2a0, "ffc300d1fd7b01a9f31300f9fd430091", "BS40"},
+    {0xfb90c64, "ff4301d1fd7b02a9f65703a9f44f04a9", "BS41"},
+    {0xfb9bb68, "ff0301d1fd7b02a9f31b00f9fd830091", "BS45"},
+    {0xfb93158, "ff8301d1fd7b01a9f91300f9f85f03a9", "BS46"},
+    {0xfb93290, "ff8301d1fd7b01a9f91300f9f85f03a9", "BS47"},
+    {0xfb93238, "ff0301d1fd7b02a9f31b00f9fd830091", "BS48"},
+    {0xfb96c3c, "fd7bbea9f30b00f9fd030091089840f9", "BS49"},
+    {0xfb96c7c, "ff4302d1fd7b03a9fb2300f9fa6705a9", "BS50"},
+    {0xfb994a0, "e923b96dfd7b01a9fc6f02a9fa6703a9", "BS51"},
+    {0xfb9944c, "ffc300d1fd7b02a9fd830091290840a9", "BS52"},
+    {0xfb93630, "090040f9230840b92808402924dd40f9", "BS54"},
+    {0xfb935d0, "ff0301d1fd7b02a9f31b00f9fd830091", "BS55"},
+    {0xfb914f8, "ffc301d1fd7b01a9fc6f02a9fa6703a9", "BS56"},
+    {0xfb936b0, "ff0304d1e84b00fdfd7b0aa9fc6f0ba9", "BS57"},
+    {0xfb90df4, "fd7bbea9f44f01a9fd030091080040f9", "BS58"},
+    {0xfb90ea0, "fd7bbea9f44f01a9fd030091080040f9", "BS59"},
+    {0xfb8f748, "ffc300d1fd7b01a9f44f02a9fd430091", "BS60"},
+    {0xfb8ea14, "ff0302d1fd7b02a9fc6f03a9fa6704a9", "BS61"},
+    {0xfb8edcc, "ff4302d1fd7b03a9fc6f04a9fa6705a9", "BS62"},
+    {0xfb904c0, "fd7bbca9f70b00f9f65702a9f44f03a9", "BS63"},
+    {0xfb9ad38, "fd7bbda9f50b00f9f44f02a9fd030091", "BS65"},
+    {0xfb94cd0, "ffc301d1fd7b02a9fa6703a9f85f04a9", "BS66"},
+    {0xf560600, "fd7bbea9f44f01a9fd030091f30300aa", "D0xf560600"},
+    {0xf58e894, "fd7bbea9f44f01a9fd030091f40300aa", "D0xf58e894"},
+    {0xf9ecfd4, "ff8301d1fd7b03a9f52300f9f44f05a9", "D0xf9ecfd4"},
+    {0x8529384, "3f2303d5fd7bbea9fc4f01a9fd030091", "D0x8529384"},
+    {0xf8a0190, "fd7bbea9f30b00f9fd030091f30300aa", "D0xf8a0190"},
+    {0xf56a660, "fd7bbea9f44f01a9fd030091f30300aa", "D0xf56a660"},
+    {0xf8a0288, "ff8303d1fd7b0aa9f85f0ba9f6570ca9", "D0xf8a0288"},
+    {0x8634428, "fd7bbea9f44f01a9fd030091140840f9", "D0x8634428"},
+    {0xfa01c74, "fd7bbea9f30b00f9fd030091f30300aa", "D0xfa01c74"},
+    {0xff7ff54, "fd7bbda9f50b00f9f44f02a9fd030091", "D0xff7ff54"},
+    {0xf56cd18, "fd7bbea9f30b00f9fd030091080840f9", "D0xf56cd18"},
+    {0xf8a0e34, "e80f1dfcfd7b01a9f44f02a9fd430091", "D0xf8a0e34"},
+    {0x102cb7f0, "ff8302d1fd7b04a9fb2b00f9fa6706a9", "D0x102cb7f0"},
+    {0x102cb1e8, "fd7bbaa9fc6f01a9fa6702a9f85f03a9", "D0x102cb1e8"},
+};
+constexpr size_t kTraceCount = sizeof(kTrace) / sizeof(kTrace[0]);
+
+struct TraceEntry {
+  uint32_t id;
+  int32_t tid;
+  uintptr_t a, b, c, d;
+  int32_t pos[3];
+  int32_t posOk;
+  uintptr_t cvp;
+};
+constexpr size_t kRing = 4096;
+TraceEntry gRing[kRing];
+std::atomic<uint32_t> gRingN{0};
+std::atomic<bool> gWin{false};
+std::atomic<int> gTraceWindows{0};
+long gPid = 0;
+Fn gTraceOrig[kTraceCount]{};
+
+// raw syscalls (no libc calls, so registers of the hooked function survive)
+#if defined(__aarch64__)
+inline long rawRead(const void *p, void *out, unsigned long n) {
+  unsigned long l[2];
+  unsigned long r[2];
+  l[0] = reinterpret_cast<unsigned long>(out);
+  l[1] = n;
+  r[0] = reinterpret_cast<unsigned long>(p);
+  r[1] = n;
+  register long x0 asm("x0") = gPid;
+  register long x1 asm("x1") = reinterpret_cast<long>(l);
+  register long x2 asm("x2") = 1;
+  register long x3 asm("x3") = reinterpret_cast<long>(r);
+  register long x4 asm("x4") = 1;
+  register long x5 asm("x5") = 0;
+  register long x8 asm("x8") = 270; // process_vm_readv
+  asm volatile("svc #0"
+               : "+r"(x0)
+               : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+               : "memory", "cc");
+  return x0;
+}
+inline long rawTid() {
+  register long x0 asm("x0");
+  register long x8 asm("x8") = 178; // gettid
+  asm volatile("svc #0" : "=r"(x0) : "r"(x8) : "memory", "cc");
+  return x0;
+}
+#else
+inline long rawRead(const void *, void *, unsigned long) { return -1; }
+inline long rawTid() { return 0; }
+#endif
+
+template <size_t I>
+uintptr_t traceDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                      void *g, void *h) {
+  if (__builtin_expect(gWin.load(std::memory_order_relaxed), 0)) {
+    const uint32_t n = gRingN.fetch_add(1, std::memory_order_relaxed);
+    if (n < kRing) {
+      TraceEntry &t = gRing[n];
+      t.id = I;
+      t.tid = static_cast<int32_t>(rawTid());
+      t.a = reinterpret_cast<uintptr_t>(a);
+      t.b = reinterpret_cast<uintptr_t>(b);
+      t.c = reinterpret_cast<uintptr_t>(c);
+      t.d = reinterpret_cast<uintptr_t>(d);
+      t.posOk = rawRead(b, t.pos, 12) == 12;
+      uintptr_t cv = 0;
+      t.cvp = rawRead(c, &cv, 8) == 8 ? cv : 0;
+    }
+  }
+  return gTraceOrig[I](a, b, c, d, e, f, g, h);
+}
+
+template <size_t... I>
+std::array<void *, sizeof...(I)> makeTraceDetours(std::index_sequence<I...>) {
+  return {reinterpret_cast<void *>(&traceDetour<I>)...};
+}
+
+void flushTrace(const int *dpos) {
+  const long myTid = tid();
+  const uint32_t n = std::min<uint32_t>(gRingN.load(), kRing);
+  const int w = gTraceWindows.fetch_add(1);
+  char buf[300];
+  snprintf(buf, sizeof(buf), "TRACE#%d destroy pos=(%d,%d,%d) entries=%u", w,
+           dpos[0], dpos[1], dpos[2], n);
+  logLine(buf);
+  std::set<std::tuple<uint32_t, int, int, int, uintptr_t>> seen;
+  int lines = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    const TraceEntry &e = gRing[i];
+    if (e.tid != myTid)
+      continue;
+    if (!seen.insert({e.id, e.pos[0], e.pos[1], e.pos[2], e.cvp}).second)
+      continue;
+    if (++lines > 220)
+      break;
+    const bool match = e.posOk && e.pos[0] == dpos[0] &&
+                       e.pos[1] == dpos[1] && e.pos[2] == dpos[2];
+    snprintf(buf, sizeof(buf),
+             "T%u %-12s%s pos=(%d,%d,%d)%s cvp=0x%lx d=%p", i,
+             kTrace[e.id].name, match ? " *POS*" : "", e.pos[0], e.pos[1],
+             e.pos[2], e.posOk ? "" : "?",
+             static_cast<unsigned long>(e.cvp ? e.cvp - gBase : 0),
+             reinterpret_cast<void *>(e.d));
+    logLine(buf);
+  }
+}
+
+constexpr uintptr_t kSpTickRva = 0xec45ffc; // ServerPlayer vtable slot 25
+constexpr const char *kSpTickHex = "ff8303d1fd7b09a9f95300f9f85f0ba9";
+Fn gSpTickOrig = nullptr;
+
+void probeServerPlayer(void *player) {
+  static std::atomic<int> cnt{0};
+  const int n = cnt.fetch_add(1);
+  if (n >= 3)
+    return;
+  uintptr_t dim = 0, bs = 0;
+  rdp(reinterpret_cast<uintptr_t>(player) + kActorDimOff, dim);
+  if (dim)
+    rdp(dim + kDimBsOff, bs);
+  void *gb = nullptr;
+  bool have;
+  int pos[3];
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    have = gHave[0];
+    std::memcpy(pos, gPos[0], sizeof(pos));
+  }
+  if (gGetBlock && bs && have)
+    gb = gGetBlock(reinterpret_cast<void *>(bs), pos);
+  char buf[300];
+  snprintf(buf, sizeof(buf),
+           "E0 sptick #%d player=%p tid=%ld dim=%p bs=%p getBlock=%p", n + 1,
+           player, tid(), reinterpret_cast<void *>(dim),
+           reinterpret_cast<void *>(bs), gb);
+  logLine(buf);
+}
+
+uintptr_t spTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                       void *g, void *h) {
+  if (gWorldProbe.load(std::memory_order_relaxed))
+    probeServerPlayer(a);
+  return gSpTickOrig(a, b, c, d, e, f, g, h);
+}
+
 uintptr_t gmTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                        void *g, void *h) {
   if (gWorldProbe.load(std::memory_order_relaxed))
@@ -590,9 +813,28 @@ uintptr_t gmTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
 
 uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                           void *g, void *h) {
-  if (gWorldProbe.load(std::memory_order_relaxed))
+  const bool probe = gWorldProbe.load(std::memory_order_relaxed);
+  bool trace = false;
+  int tpos[3] = {0, 0, 0};
+  if (probe) {
     probeGameMode(a, "destroy");
-  return gGmDestroyOrig(a, b, c, d, e, f, g, h);
+    if (gTraceWindows.load() < 6) {
+      uintptr_t pl = 0;
+      rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, pl);
+      if (pl && pl != gLocalPlayer.load() && safeRead(b, tpos, sizeof(tpos)))
+        trace = true; // server-side destroy
+    }
+  }
+  if (trace) {
+    gRingN.store(0);
+    gWin.store(true);
+  }
+  const uintptr_t r = gGmDestroyOrig(a, b, c, d, e, f, g, h);
+  if (trace) {
+    gWin.store(false);
+    flushTrace(tpos);
+  }
+  return r;
 }
 
 uintptr_t lpTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
@@ -754,6 +996,25 @@ public:
       const bool t3 = install(kLpTickRva, kLpTickHex,
                               reinterpret_cast<void *>(&lpTickDetour),
                               &gLpTickOrig, mLpTickHook);
+      const bool t4 = install(kSpTickRva, kSpTickHex,
+                              reinterpret_cast<void *>(&spTickDetour),
+                              &gSpTickOrig, mSpTickHook);
+      gPid = getpid();
+      static const auto trD =
+          makeTraceDetours(std::make_index_sequence<kTraceCount>{});
+      int trOk = 0;
+      for (size_t i = 0; i < kTraceCount; ++i) {
+        auto *taddr = reinterpret_cast<void *>(base + kTrace[i].rva);
+        if (!matchHex(taddr, kTrace[i].hex))
+          continue;
+        mTraceHooks[i] = pl::memory::HookHandle(
+            taddr, trD[i], reinterpret_cast<void **>(&gTraceOrig[i]),
+            pl::memory::HookPriority::Normal);
+        if (mTraceHooks[i].installed())
+          ++trOk;
+      }
+      logLine("trace hooks: " + std::to_string(trOk) + "/" +
+              std::to_string(kTraceCount) + " spTick=" + std::to_string(t4));
       auto *gbAddr = reinterpret_cast<void *>(base + kGetBlockRva);
       const bool gbOk = matchPattern(gbAddr, kGetBlockPat,
                                      sizeof(kGetBlockPat) / sizeof(int));
@@ -791,6 +1052,9 @@ public:
     mGmTickHook.reset();
     mGmDestroyHook.reset();
     mLpTickHook.reset();
+    mSpTickHook.reset();
+    for (auto &h : mTraceHooks)
+      h.reset();
     for (auto &h : mHooks)
       h.reset();
     return true;
@@ -806,6 +1070,8 @@ private:
   pl::memory::HookHandle mGmTickHook;
   pl::memory::HookHandle mGmDestroyHook;
   pl::memory::HookHandle mLpTickHook;
+  pl::memory::HookHandle mSpTickHook;
+  std::array<pl::memory::HookHandle, kTraceCount> mTraceHooks;
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
