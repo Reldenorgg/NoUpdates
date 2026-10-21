@@ -252,7 +252,7 @@ bool gameHudVisible() {
          !gPauseFn(nullptr, nullptr);
 }
 
-void handleTap(void *posPtr) {
+void handleTap(void *posPtr, void *faceArg) {
   int pos[3];
   if (!safeRead(posPtr, pos, sizeof(pos)))
     return;
@@ -267,8 +267,9 @@ void handleTap(void *posPtr) {
   if (idx == 1)
     gArmed.store(false); // both points set: taps behave normally again
   char buf[96];
-  snprintf(buf, sizeof(buf), "SELECT pos%d = (%d,%d,%d)", idx + 1, pos[0],
-           pos[1], pos[2]);
+  snprintf(buf, sizeof(buf), "SELECT pos%d = (%d,%d,%d) face=%u", idx + 1,
+           pos[0], pos[1], pos[2],
+           static_cast<unsigned>(reinterpret_cast<uintptr_t>(faceArg) & 0xff));
   logLine(buf);
   gHudDirty.store(true);
 }
@@ -458,7 +459,7 @@ void probeGameMode(void *gm, const char *tag);
 uintptr_t buildDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                       void *g, void *h) {
   if (gArmed.load(std::memory_order_relaxed)) {
-    handleTap(b);
+    handleTap(b, c);
     return 0; // swallow the tap: no block placed
   }
   if (gWorldProbe.load(std::memory_order_relaxed))
@@ -687,8 +688,10 @@ uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
     }
   }
 
-  // E5 (one shot): call BlockSource::setBlock (vtable slot 32) on the SERVER
-  // BlockSource: copy the block found at Pos2 onto Pos1 (far from the player).
+  // E5b (one shot): call BlockSource::setBlock (vtable slot 32) on the SERVER
+  // BlockSource. Source = first solid block at/below Pos2 (or Pos1); target =
+  // first AIR cell at/above Pos1. Tries a few argument variants, reads back
+  // immediately and again 300 ms later.
   if (!tInRemote && gE5.load(std::memory_order_relaxed) && gGetBlock) {
     uintptr_t player = 0;
     rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, player);
@@ -708,31 +711,85 @@ uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
         rdp(bs, vt);
       if (vt)
         rdp(vt + 8 * kSetBlockSlot, fnAddr);
-      if (have1 && have2 && bs && fnAddr) {
+      if (have1 && bs && fnAddr) {
         gE5.store(false);
-        void *src = gGetBlock(reinterpret_cast<void *>(bs), p2);
-        void *before = gGetBlock(reinterpret_cast<void *>(bs), p1);
-        alignas(16) unsigned char ctx[256];
-        std::memset(ctx, 0, sizeof(ctx)); // default BlockChangeContext (assumed)
-        using SetFn = uintptr_t (*)(void *, const int *, void *, int, void *,
-                                    void *);
-        tInRemote = true;
-        const uintptr_t rr = reinterpret_cast<SetFn>(fnAddr)(
-            reinterpret_cast<void *>(bs), p1, src, 3, nullptr, ctx);
-        tInRemote = false;
-        void *after = gGetBlock(reinterpret_cast<void *>(bs), p1);
-        char buf[360];
+        void *B = reinterpret_cast<void *>(bs);
+        int top[3] = {p1[0], 319, p1[2]};
+        void *air = gGetBlock(B, top);
+        auto firstSolid = [&](const int *p) -> void * {
+          for (int dy = 0; dy >= -3; --dy) {
+            int q[3] = {p[0], p[1] + dy, p[2]};
+            void *blk = gGetBlock(B, q);
+            if (blk && blk != air)
+              return blk;
+          }
+          return nullptr;
+        };
+        void *src = have2 ? firstSolid(p2) : nullptr;
+        if (!src)
+          src = firstSolid(p1);
+        int tgt[3] = {0, 0, 0};
+        bool found = false;
+        for (int dy = 0; dy <= 8 && !found; ++dy) {
+          int q[3] = {p1[0], p1[1] + dy, p1[2]};
+          if (gGetBlock(B, q) == air) {
+            std::memcpy(tgt, q, sizeof(tgt));
+            found = true;
+          }
+        }
+        char buf[420];
         snprintf(buf, sizeof(buf),
-                 "E5 remote setBlock tid=%ld pos1=(%d,%d,%d) pos2=(%d,%d,%d) "
-                 "fn=0x%lx ret=%lu src=%p before=%p after=%p changed=%d "
-                 "sameAsSrc=%d",
-                 tid(), p1[0], p1[1], p1[2], p2[0], p2[1], p2[2],
-                 static_cast<unsigned long>(fnAddr - gBase),
-                 static_cast<unsigned long>(rr), src, before, after,
-                 before != after ? 1 : 0, after == src ? 1 : 0);
+                 "E5b setup tid=%ld air=%p src=%p target=(%d,%d,%d) found=%d "
+                 "fn=0x%lx",
+                 tid(), air, src, tgt[0], tgt[1], tgt[2], found ? 1 : 0,
+                 static_cast<unsigned long>(fnAddr - gBase));
         logLine(buf);
+        if (src && found) {
+          struct Variant {
+            int flags;
+            int ctxMode;
+          };
+          const Variant variants[] = {{3, 0}, {2, 0}, {0, 0}, {3, 1}};
+          using SetFn = uintptr_t (*)(void *, const int *, void *, int, void *,
+                                      void *);
+          bool done = false;
+          for (int i = 0; i < 4 && !done; ++i) {
+            alignas(16) unsigned char ctx[256];
+            std::memset(ctx, 0, sizeof(ctx));
+            if (variants[i].ctxMode == 1)
+              std::memcpy(ctx, &player, sizeof(player));
+            tInRemote = true;
+            const uintptr_t rr = reinterpret_cast<SetFn>(fnAddr)(
+                B, tgt, src, variants[i].flags, nullptr, ctx);
+            tInRemote = false;
+            void *after = gGetBlock(B, tgt);
+            snprintf(buf, sizeof(buf),
+                     "E5b try%d flags=%d ctxMode=%d ret=%lu after=%p "
+                     "isSrc=%d isAir=%d",
+                     i, variants[i].flags, variants[i].ctxMode,
+                     static_cast<unsigned long>(rr), after,
+                     after == src ? 1 : 0, after == air ? 1 : 0);
+            logLine(buf);
+            done = (after == src);
+          }
+          const uintptr_t cpy[3] = {bs, reinterpret_cast<uintptr_t>(src),
+                                    reinterpret_cast<uintptr_t>(air)};
+          const int t0 = tgt[0], t1 = tgt[1], t2 = tgt[2];
+          GetBlockFn gb = gGetBlock;
+          std::thread([cpy, t0, t1, t2, gb] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            int q[3] = {t0, t1, t2};
+            void *later = gb(reinterpret_cast<void *>(cpy[0]), q);
+            char b2[200];
+            snprintf(b2, sizeof(b2),
+                     "E5b delayed(300ms) later=%p isSrc=%d isAir=%d", later,
+                     reinterpret_cast<uintptr_t>(later) == cpy[1] ? 1 : 0,
+                     reinterpret_cast<uintptr_t>(later) == cpy[2] ? 1 : 0);
+            logLine(b2);
+          }).detach();
+        }
       } else {
-        logLine("E5 skipped: need Pos1 and Pos2 set");
+        logLine("E5b skipped: need Pos1");
       }
     }
   }
