@@ -480,6 +480,15 @@ constexpr uintptr_t kGmPlayerOff = 0x8;       // GameMode -> Player
 constexpr uintptr_t kActorDimOff = 448;       // Actor -> Dimension
 constexpr uintptr_t kDimBsOff = 208;          // Dimension -> BlockSource
 constexpr const char *kProbeId = "axiom.worldprobe";
+constexpr const char *kE4Id = "axiom.e4";
+constexpr const char *kE5Id = "axiom.e5";
+std::atomic<bool> gE4{false};
+std::atomic<bool> gE5{false};
+// BlockSource::setBlock = vtable slot 32 (offset 0x100) per the Levi devs
+constexpr uintptr_t kSetBlockRva = 0xfb9274c;
+constexpr const char *kSetBlockHex = "ff0302d1fd7b02a9fb1b00f9fa6704a9";
+constexpr int kSetBlockSlot = 32;
+Fn gSetBlockOrig = nullptr;
 
 // BlockSource::getBlock prologue (-1 = wildcard)
 constexpr int kGetBlockPat[] = {
@@ -588,11 +597,146 @@ uintptr_t gmTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
   return gGmTickOrig(a, b, c, d, e, f, g, h);
 }
 
+thread_local bool tInRemote = false;
+bool tInRemoteFlag() { return tInRemote; }
+
+uintptr_t setBlockLogDetour(void *a, void *b, void *c, void *d, void *e,
+                            void *f, void *g, void *h) {
+  static std::atomic<int> cnt{0};
+  static std::atomic<uint64_t> last{0};
+  if (gWorldProbe.load(std::memory_order_relaxed) && !tInRemoteFlag() &&
+      cnt.load() < 150) {
+    int pos[3] = {0, 0, 0};
+    const bool ok = safeRead(b, pos, sizeof(pos));
+    uintptr_t cv = 0;
+    rdp(reinterpret_cast<uintptr_t>(c), cv);
+    const int flags = static_cast<int>(reinterpret_cast<uintptr_t>(d));
+    const uint64_t key =
+        (static_cast<uint64_t>(static_cast<uint32_t>(pos[0])) * 73856093ull) ^
+        (static_cast<uint64_t>(static_cast<uint32_t>(pos[1])) * 19349663ull) ^
+        (static_cast<uint64_t>(static_cast<uint32_t>(pos[2])) * 83492791ull) ^
+        (reinterpret_cast<uintptr_t>(c) >> 4) ^ flags;
+    if (last.exchange(key) != key) {
+      char buf[300];
+      snprintf(buf, sizeof(buf),
+               "SB #%d bs=%p tid=%ld pos=(%d,%d,%d)%s block=%p blkVp=0x%lx "
+               "flags=%d sync=%p ctx=%p",
+               cnt.fetch_add(1), a, tid(), pos[0], pos[1], pos[2],
+               ok ? "" : "?", c,
+               static_cast<unsigned long>(cv ? cv - gBase : 0), flags, e, f);
+      logLine(buf);
+    }
+  }
+  return gSetBlockOrig(a, b, c, d, e, f, g, h);
+}
+
+
+// Reads the BlockSource of the player that owns this GameMode.
+uintptr_t blockSourceOf(void *gm) {
+  uintptr_t player = 0, dim = 0, bs = 0;
+  rdp(reinterpret_cast<uintptr_t>(gm) + kGmPlayerOff, player);
+  if (player)
+    rdp(player + kActorDimOff, dim);
+  if (dim)
+    rdp(dim + kDimBsOff, bs);
+  return bs;
+}
+
 uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                           void *g, void *h) {
   if (gWorldProbe.load(std::memory_order_relaxed))
     probeGameMode(a, "destroy");
-  return gGmDestroyOrig(a, b, c, d, e, f, g, h);
+  const uintptr_t r = gGmDestroyOrig(a, b, c, d, e, f, g, h);
+
+  // E4 (one shot): when the SERVER GameMode finishes a destroyBlock, call the
+  // same function again for Pos1 (can be far from the player) and report.
+  if (!tInRemote && gE4.load(std::memory_order_relaxed) && gGetBlock) {
+    uintptr_t player = 0;
+    rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, player);
+    if (player && player != gLocalPlayer.load()) {
+      int target[3], broken[3] = {0, 0, 0};
+      bool have;
+      {
+        std::lock_guard<std::mutex> lk(gSelMu);
+        have = gHave[0];
+        std::memcpy(target, gPos[0], sizeof(target));
+      }
+      safeRead(b, broken, sizeof(broken));
+      const uintptr_t bs = blockSourceOf(a);
+      if (have && bs &&
+          (target[0] != broken[0] || target[1] != broken[1] ||
+           target[2] != broken[2])) {
+        gE4.store(false);
+        tInRemote = true;
+        void *before = gGetBlock(reinterpret_cast<void *>(bs), target);
+        const uintptr_t rr = gGmDestroyOrig(a, target, c, d, e, f, g, h);
+        void *after = gGetBlock(reinterpret_cast<void *>(bs), target);
+        tInRemote = false;
+        char buf[300];
+        snprintf(buf, sizeof(buf),
+                 "E4 remote destroy tid=%ld broken=(%d,%d,%d) target=(%d,%d,%d) "
+                 "dx=%d dy=%d dz=%d ret=%lu before=%p after=%p changed=%d",
+                 tid(), broken[0], broken[1], broken[2], target[0], target[1],
+                 target[2], target[0] - broken[0], target[1] - broken[1],
+                 target[2] - broken[2], static_cast<unsigned long>(rr), before,
+                 after, before != after ? 1 : 0);
+        logLine(buf);
+      } else {
+        logLine("E4 skipped: need Pos1 different from the broken block");
+      }
+    }
+  }
+
+  // E5 (one shot): call BlockSource::setBlock (vtable slot 32) on the SERVER
+  // BlockSource: copy the block found at Pos2 onto Pos1 (far from the player).
+  if (!tInRemote && gE5.load(std::memory_order_relaxed) && gGetBlock) {
+    uintptr_t player = 0;
+    rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, player);
+    if (player && player != gLocalPlayer.load()) {
+      int p1[3], p2[3];
+      bool have1, have2;
+      {
+        std::lock_guard<std::mutex> lk(gSelMu);
+        have1 = gHave[0];
+        have2 = gHave[1];
+        std::memcpy(p1, gPos[0], sizeof(p1));
+        std::memcpy(p2, gPos[1], sizeof(p2));
+      }
+      const uintptr_t bs = blockSourceOf(a);
+      uintptr_t vt = 0, fnAddr = 0;
+      if (bs)
+        rdp(bs, vt);
+      if (vt)
+        rdp(vt + 8 * kSetBlockSlot, fnAddr);
+      if (have1 && have2 && bs && fnAddr) {
+        gE5.store(false);
+        void *src = gGetBlock(reinterpret_cast<void *>(bs), p2);
+        void *before = gGetBlock(reinterpret_cast<void *>(bs), p1);
+        alignas(16) unsigned char ctx[256];
+        std::memset(ctx, 0, sizeof(ctx)); // default BlockChangeContext (assumed)
+        using SetFn = uintptr_t (*)(void *, const int *, void *, int, void *,
+                                    void *);
+        tInRemote = true;
+        const uintptr_t rr = reinterpret_cast<SetFn>(fnAddr)(
+            reinterpret_cast<void *>(bs), p1, src, 3, nullptr, ctx);
+        tInRemote = false;
+        void *after = gGetBlock(reinterpret_cast<void *>(bs), p1);
+        char buf[360];
+        snprintf(buf, sizeof(buf),
+                 "E5 remote setBlock tid=%ld pos1=(%d,%d,%d) pos2=(%d,%d,%d) "
+                 "fn=0x%lx ret=%lu src=%p before=%p after=%p changed=%d "
+                 "sameAsSrc=%d",
+                 tid(), p1[0], p1[1], p1[2], p2[0], p2[1], p2[2],
+                 static_cast<unsigned long>(fnAddr - gBase),
+                 static_cast<unsigned long>(rr), src, before, after,
+                 before != after ? 1 : 0, after == src ? 1 : 0);
+        logLine(buf);
+      } else {
+        logLine("E5 skipped: need Pos1 and Pos2 set");
+      }
+    }
+  }
+  return r;
 }
 
 uintptr_t lpTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
@@ -606,6 +750,10 @@ void onToggle(std::string_view id, bool enabled) {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(enabled);
     saveState(enabled);
+  } else if (id == kE4Id) {
+    gE4.store(enabled);
+  } else if (id == kE5Id) {
+    gE5.store(enabled);
   } else if (id == kProbeId) {
     gWorldProbe.store(enabled);
   } else if (id == kToolsId) {
@@ -754,6 +902,10 @@ public:
       const bool t3 = install(kLpTickRva, kLpTickHex,
                               reinterpret_cast<void *>(&lpTickDetour),
                               &gLpTickOrig, mLpTickHook);
+      const bool t5 = install(kSetBlockRva, kSetBlockHex,
+                              reinterpret_cast<void *>(&setBlockLogDetour),
+                              &gSetBlockOrig, mSetBlockHook);
+      logLine("setBlock slot32 hook=" + std::to_string(t5));
       auto *gbAddr = reinterpret_cast<void *>(base + kGetBlockRva);
       const bool gbOk = matchPattern(gbAddr, kGetBlockPat,
                                      sizeof(kGetBlockPat) / sizeof(int));
@@ -772,6 +924,22 @@ public:
                  .onToggle(onToggle)
                  .registerModule();
         logLine("step: World Probe done");
+        r &= pl::modmenu::ModuleBuilder(kE4Id, "Remote Destroy (test)")
+                 .modId(mSelf.getId())
+                 .description("One-shot test: set Pos1 on a far block, turn "
+                              "on, then break any block next to you.")
+                 .defaultEnabled(false)
+                 .onToggle(onToggle)
+                 .registerModule();
+        logLine("step: Remote Destroy done");
+        r &= pl::modmenu::ModuleBuilder(kE5Id, "Remote Set (test)")
+                 .modId(mSelf.getId())
+                 .description("One-shot: set Pos1 (far) and Pos2 (block to "
+                              "copy), turn on, break any block nearby.")
+                 .defaultEnabled(false)
+                 .onToggle(onToggle)
+                 .registerModule();
+        logLine("step: Remote Set done");
       }
     }
     return r;
@@ -784,6 +952,10 @@ public:
     gToolsOn.store(false);
     gStop.store(true);
     gWorldProbe.store(false);
+    gE4.store(false);
+    gE5.store(false);
+    pl::modmenu::unregisterModule(kE5Id);
+    pl::modmenu::unregisterModule(kE4Id);
     pl::modmenu::unregisterModule(kProbeId);
     pl::modmenu::unregisterModule(kToolsId);
     pl::modmenu::unregisterModule(kModuleId);
@@ -791,6 +963,7 @@ public:
     mGmTickHook.reset();
     mGmDestroyHook.reset();
     mLpTickHook.reset();
+    mSetBlockHook.reset();
     for (auto &h : mHooks)
       h.reset();
     return true;
@@ -806,6 +979,7 @@ private:
   pl::memory::HookHandle mGmTickHook;
   pl::memory::HookHandle mGmDestroyHook;
   pl::memory::HookHandle mLpTickHook;
+  pl::memory::HookHandle mSetBlockHook;
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
