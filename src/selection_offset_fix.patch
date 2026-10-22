@@ -1,0 +1,38 @@
+--- src/NoUpdates.cpp
++++ src/NoUpdates.cpp
+@@ -1,9 +1,9 @@
+ // Axiom for Levi v1.0 - Minecraft Bedrock 26.52.3 (arm64)
+ //  * No Updates : freezes block events (physics, redstone, ticks)
+ //  * SEL        : HUD button; next two block taps set Pos1 / Pos2
+-//  * DEL        : HUD button; removes every block of the selection through
+-//                 the server-side GameMode::destroyBlock (works out of reach).
+-//                 The job runs when you break any block (server thread).
++//  * DEL        : current working delete operation; removes every block of the
++//                 selection through server-side GameMode::destroyBlock.
++//                 Fill/air-hand detection is not implemented in this revision.
+ #include <pl/Input.hpp>
+ #include <pl/Mod.hpp>
+ #include <pl/ModMenu.hpp>
+@@ -280,19 +280,15 @@
+          !gPauseFn(nullptr, nullptr);
+ }
+ 
+-// buildBlock receives the cell where a block would be placed; the clicked
+-// block is that cell minus the face normal (0=-y 1=+y 2=-z 3=+z 4=-x 5=+x).
++// Store the exact BlockPos received by GameMode::buildBlock.
++// The previous face-normal adjustment shifted selection by one block for
++// the observed Bedrock 26.52.3 call path.
+ void handleTap(void *posPtr, void *faceArg) {
+   int pos[3];
+   if (!safeRead(posPtr, pos, sizeof(pos)))
+     return;
+   const unsigned face =
+       static_cast<unsigned>(reinterpret_cast<uintptr_t>(faceArg) & 0xff);
+-  static const int nrm[6][3] = {{0, -1, 0}, {0, 1, 0}, {0, 0, -1},
+-                                {0, 0, 1},  {-1, 0, 0}, {1, 0, 0}};
+-  if (face < 6)
+-    for (int i = 0; i < 3; ++i)
+-      pos[i] -= nrm[face][i];
+   int idx;
+   {
+     std::lock_guard<std::mutex> lk(gSelMu);
