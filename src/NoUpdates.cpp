@@ -1,8 +1,9 @@
-// Axiom for Levi v0.3 - Minecraft Bedrock 26.52.3 (arm64)
-//  * No Updates: freezes block events (physics, redstone, ticks)
-//  * Select: HUD button arms selection; next two block taps set Pos1 / Pos2
-// HUD and touch follow the pattern used by other Levi mods: own draw
-// commands + pl::input touch callback (no ButtonBuilder).
+// Axiom for Levi v1.0 - Minecraft Bedrock 26.52.3 (arm64)
+//  * No Updates : freezes block events (physics, redstone, ticks)
+//  * SEL        : HUD button; next two block taps set Pos1 / Pos2
+//  * DEL        : HUD button; removes every block of the selection through
+//                 the server-side GameMode::destroyBlock (works out of reach).
+//                 The job runs when you break any block (server thread).
 #include <pl/Input.hpp>
 #include <pl/Mod.hpp>
 #include <pl/ModMenu.hpp>
@@ -23,7 +24,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <functional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -82,12 +82,26 @@ constexpr unsigned char kExpected[16] = {0x02, 0x20, 0x41, 0xa9, 0x09, 0x04,
 constexpr const char *kModuleId = "no_updates.main";
 constexpr const char *kToolsId = "axiom.tools";
 
-// GameMode::buildBlock (vtable slot 7), 26.52.3
-constexpr uintptr_t kBuildRva = 0xf8a117c;
+// ---- game functions (26.52.3) -- every address is verified at load time
+constexpr uintptr_t kBuildRva = 0xf8a117c; // GameMode vtable slot 7
 constexpr const char *kBuildHex = "ffc304d1fd7b0da9fc7300f9fa670fa9";
+constexpr uintptr_t kGmDestroyRva = 0xf8a03ac; // GameMode vtable slot 3
+constexpr const char *kGmDestroyHex = "ff0302d1fd7b04a9f85f05a9f65706a9";
+constexpr uintptr_t kLpTickRva = 0xaac7dd8; // LocalPlayer vtable slot 25
+constexpr const char *kLpTickHex = "e80f19fcfd7b01a9fc6f02a9fa6703a9";
+constexpr uintptr_t kGetBlockRva = 0xfb91918; // BlockSource vtable slot 2
+constexpr uintptr_t kGmPlayerOff = 0x8;       // GameMode -> Player
+constexpr uintptr_t kActorDimOff = 448;       // Actor -> Dimension
+constexpr uintptr_t kDimBsOff = 208;          // Dimension -> BlockSource
+
+constexpr int kGetBlockPat[] = {
+    -1, -1, -1, 0xD1, -1, -1, -1, 0xA9, -1, -1, -1, 0xA9, -1, -1, -1, 0xA9,
+    -1, -1, -1, 0x91, 0x56, 0xD0, 0x3B, 0xD5, -1, -1, -1, 0xF9, -1, -1, -1,
+    0xF9, -1, -1, -1, 0xB9, -1, -1, -1, 0x79, 0x1F, 0x01, 0x09, 0x6B};
 
 using Fn = uintptr_t (*)(void *, void *, void *, void *, void *, void *,
                          void *, void *);
+using GetBlockFn = void *(*)(void *region, const int *pos);
 
 std::atomic<bool> gFrozen[3];
 Fn gOrig[kCount]{};
@@ -106,6 +120,9 @@ std::array<void *, sizeof...(I)> makeDetours(std::index_sequence<I...>) {
 }
 
 // ---------------------------------------------------------------- helpers
+uintptr_t gBase = 0;
+std::string gLogPath = "/dev/null";
+
 bool safeRead(const void *p, void *out, size_t n) {
   if (!p)
     return false;
@@ -113,6 +130,10 @@ bool safeRead(const void *p, void *out, size_t n) {
   struct iovec r{const_cast<void *>(p), n};
   return process_vm_readv(getpid(), &l, 1, &r, 1, 0) ==
          static_cast<ssize_t>(n);
+}
+
+bool rdp(uintptr_t addr, uintptr_t &out) {
+  return addr > 0x10000 && safeRead(reinterpret_cast<void *>(addr), &out, 8);
 }
 
 bool matchHex(const void *p, const char *hex) {
@@ -124,8 +145,14 @@ bool matchHex(const void *p, const char *hex) {
   return true;
 }
 
-uintptr_t gBase = 0;
-std::string gLogPath = "/dev/null";
+bool matchPattern(const void *p, const int *pat, size_t n) {
+  const unsigned char *b = static_cast<const unsigned char *>(p);
+  for (size_t i = 0; i < n; ++i)
+    if (pat[i] >= 0 && b[i] != pat[i])
+      return false;
+  return true;
+}
+
 void logLine(const std::string &line) {
   std::ofstream f(gLogPath, std::ios::app);
   if (f.good())
@@ -204,7 +231,8 @@ bool gHave[2];
 int gNext = 0;
 
 struct Geo {
-  float bx = 0, by = 0, bs = 0;
+  float bx = 0, by = 0, bs = 0; // SEL button
+  float dy = 0;                 // DEL button (same x and size)
 } gGeo;
 std::mutex gGeoMu;
 
@@ -219,8 +247,8 @@ void *findSym(const char *name) {
   return nullptr;
 }
 
-// pl::modmenu::getHudSurfaceSize() returns two floats (width, height).
-// Not declared in SDK 0.2.2, so it is looked up in the launcher at runtime.
+// pl::modmenu::getHudSurfaceSize() returns two floats (width, height); it is
+// not declared in SDK 0.2.2, so it is resolved in the launcher at runtime.
 struct HudSize {
   float width;
   float height;
@@ -252,10 +280,19 @@ bool gameHudVisible() {
          !gPauseFn(nullptr, nullptr);
 }
 
+// buildBlock receives the cell where a block would be placed; the clicked
+// block is that cell minus the face normal (0=-y 1=+y 2=-z 3=+z 4=-x 5=+x).
 void handleTap(void *posPtr, void *faceArg) {
   int pos[3];
   if (!safeRead(posPtr, pos, sizeof(pos)))
     return;
+  const unsigned face =
+      static_cast<unsigned>(reinterpret_cast<uintptr_t>(faceArg) & 0xff);
+  static const int nrm[6][3] = {{0, -1, 0}, {0, 1, 0}, {0, 0, -1},
+                                {0, 0, 1},  {-1, 0, 0}, {1, 0, 0}};
+  if (face < 6)
+    for (int i = 0; i < 3; ++i)
+      pos[i] -= nrm[face][i];
   int idx;
   {
     std::lock_guard<std::mutex> lk(gSelMu);
@@ -268,8 +305,7 @@ void handleTap(void *posPtr, void *faceArg) {
     gArmed.store(false); // both points set: taps behave normally again
   char buf[96];
   snprintf(buf, sizeof(buf), "SELECT pos%d = (%d,%d,%d) face=%u", idx + 1,
-           pos[0], pos[1], pos[2],
-           static_cast<unsigned>(reinterpret_cast<uintptr_t>(faceArg) & 0xff));
+           pos[0], pos[1], pos[2], face);
   logLine(buf);
   gHudDirty.store(true);
 }
@@ -285,6 +321,67 @@ void toggleArmed() {
   gHudDirty.store(true);
 }
 
+// -------------------------------------------------------------- DEL job
+constexpr long long kMaxCells = 4000000; // refuse bigger boxes
+constexpr long long kBudgetMs = 200;     // server-thread time per trigger
+
+std::mutex gDelMu;
+std::atomic<bool> gDelActive{false};
+int gDelMin[3], gDelMax[3], gDelCur[3];
+long long gDelTotal = 0, gDelDone = 0, gDelRemoved = 0;
+void *gDelAir = nullptr;
+std::string gDelMsg;
+
+void startOrCancelDel() {
+  if (gDelActive.load()) { // tap again = cancel
+    std::lock_guard<std::mutex> lk(gDelMu);
+    gDelActive.store(false);
+    gDelMsg = "DEL cancelled";
+    gHudDirty.store(true);
+    return;
+  }
+  int a[3], b[3];
+  bool ok;
+  {
+    std::lock_guard<std::mutex> lk(gSelMu);
+    ok = gHave[0] && gHave[1];
+    std::memcpy(a, gPos[0], sizeof(a));
+    std::memcpy(b, gPos[1], sizeof(b));
+  }
+  std::lock_guard<std::mutex> lk(gDelMu);
+  if (!ok) {
+    gDelMsg = "DEL: select Pos1 and Pos2 first";
+    gHudDirty.store(true);
+    return;
+  }
+  long long vol = 1;
+  for (int i = 0; i < 3; ++i) {
+    gDelMin[i] = std::min(a[i], b[i]);
+    gDelMax[i] = std::max(a[i], b[i]);
+    vol *= (gDelMax[i] - gDelMin[i] + 1);
+  }
+  if (vol > kMaxCells) {
+    gDelMsg = "DEL: selection too large (max 4,000,000)";
+    gHudDirty.store(true);
+    return;
+  }
+  gDelCur[0] = gDelMin[0];
+  gDelCur[1] = gDelMax[1]; // top to bottom
+  gDelCur[2] = gDelMin[2];
+  gDelTotal = vol;
+  gDelDone = gDelRemoved = 0;
+  gDelAir = nullptr;
+  gDelMsg = "DEL ready: break any block to run";
+  gDelActive.store(true);
+  gHudDirty.store(true);
+  char buf[140];
+  snprintf(buf, sizeof(buf), "DEL start box (%d,%d,%d)-(%d,%d,%d) cells=%lld",
+           gDelMin[0], gDelMin[1], gDelMin[2], gDelMax[0], gDelMax[1],
+           gDelMax[2], vol);
+  logLine(buf);
+}
+
+// ------------------------------------------------------------------ HUD
 pl::modmenu::DrawCommand makeRect(float x, float y, float w, float h,
                                   uint32_t color, float radius) {
   pl::modmenu::DrawCommand d;
@@ -332,12 +429,14 @@ void renderHud() {
   const float H = surf.height;
   const float s = std::clamp(H * 0.13f, 84.0f, 150.0f);
   const float bx = W - s - W * 0.03f;
-  const float by = H * 0.28f;
+  const float by = H * 0.22f;
+  const float dy = by + s * 1.15f;
   {
     std::lock_guard<std::mutex> lk(gGeoMu);
     gGeo.bx = bx;
     gGeo.by = by;
     gGeo.bs = s;
+    gGeo.dy = dy;
   }
 
   bool armed = gArmed.load(), h0, h1;
@@ -350,13 +449,29 @@ void renderHud() {
     std::memcpy(p1, gPos[1], sizeof(p1));
     next = gNext;
   }
+  bool delOn;
+  long long dTotal, dDone, dRemoved;
+  std::string dMsg;
+  {
+    std::lock_guard<std::mutex> lk(gDelMu);
+    delOn = gDelActive.load();
+    dTotal = gDelTotal;
+    dDone = gDelDone;
+    dRemoved = gDelRemoved;
+    dMsg = gDelMsg;
+  }
 
   std::vector<pl::modmenu::DrawCommand> cmds;
-  const uint32_t fill = armed ? 0xE6D32F2F : 0xB0303030;
-  cmds.push_back(makeRect(bx, by, s, s, fill, s * 0.2f));
+  cmds.push_back(makeRect(bx, by, s, s, armed ? 0xE6D32F2F : 0xB0303030,
+                          s * 0.2f));
   const char *label = armed ? (next == 0 ? "P1" : "P2") : "SEL";
   cmds.push_back(makeText(label, bx + s * 0.5f, by + s * 0.5f + s * 0.09f,
                           s * 0.26f, 0xFFFFFFFF, -2.0f));
+  cmds.push_back(makeRect(bx, dy, s, s, delOn ? 0xE6D32F2F : 0xB0303030,
+                          s * 0.2f));
+  cmds.push_back(makeText(delOn ? "STOP" : "DEL", bx + s * 0.5f,
+                          dy + s * 0.5f + s * 0.09f, s * 0.26f, 0xFFFFFFFF,
+                          -2.0f));
 
   const float ts = s * 0.2f;
   float ty = by + ts;
@@ -367,7 +482,7 @@ void renderHud() {
     cmds.push_back(makeText(t, bx - 10.0f - ts * 0.5f, ty, ts, 0xFFFFFFFF, -1.0f));
     ty += ts * 1.7f;
   };
-  char buf[80];
+  char buf[96];
   if (h0) {
     snprintf(buf, sizeof(buf), "Pos1: %d, %d, %d", p0[0], p0[1], p0[2]);
     line(buf);
@@ -381,6 +496,13 @@ void renderHud() {
     snprintf(buf, sizeof(buf), "%lld blocks", n);
     line(buf);
   }
+  if (delOn) {
+    snprintf(buf, sizeof(buf), "DEL %lld/%lld  removed %lld", dDone, dTotal,
+             dRemoved);
+    line(buf);
+  }
+  if (!dMsg.empty())
+    line(dMsg);
   pl::modmenu::submitDrawCommands(kToolsId, cmds);
   gHudShown = true;
 }
@@ -393,7 +515,9 @@ void uiLoop() {
     const bool vis = gameHudVisible();
     const HudSize surf = hudSize();
     const bool changed = vis != lastVis || surf.width != lw || surf.height != lh;
-    if (gHudDirty.exchange(false) || changed || nowMs() - last > 1500) {
+    const bool delOn = gDelActive.load();
+    if (gHudDirty.exchange(false) || changed || nowMs() - last > 1500 ||
+        (delOn && nowMs() - last > 300)) {
       renderHud();
       last = nowMs();
       lastVis = vis;
@@ -407,6 +531,7 @@ void uiLoop() {
 
 bool onTouch(const pl::input::TouchEvent &ev) {
   static int ptr = -1;
+  static int which = -1; // 0 = SEL, 1 = DEL
   if (!gToolsOn.load() || !gameHudVisible()) {
     ptr = -1;
     return false;
@@ -418,13 +543,18 @@ bool onTouch(const pl::input::TouchEvent &ev) {
   }
   if (g.bs <= 0)
     return false;
-  const bool inside = ev.x >= g.bx && ev.x < g.bx + g.bs && ev.y >= g.by &&
-                      ev.y < g.by + g.bs;
+  auto inside = [&](float top) {
+    return ev.x >= g.bx && ev.x < g.bx + g.bs && ev.y >= top &&
+           ev.y < top + g.bs;
+  };
+  const bool inSel = inside(g.by);
+  const bool inDel = inside(g.dy);
   switch (ev.action) {
   case 0:
   case 5:
-    if (ptr < 0 && inside) {
+    if (ptr < 0 && (inSel || inDel)) {
       ptr = ev.pointerId;
+      which = inSel ? 0 : 1;
       return true;
     }
     break;
@@ -435,15 +565,20 @@ bool onTouch(const pl::input::TouchEvent &ev) {
   case 1:
   case 6:
     if (ptr == ev.pointerId) {
+      const int w = which;
       ptr = -1;
-      if (inside)
+      which = -1;
+      if (w == 0 && inSel)
         toggleArmed();
+      else if (w == 1 && inDel)
+        startOrCancelDel();
       return true;
     }
     break;
   case 3:
     if (ptr >= 0) {
       ptr = -1;
+      which = -1;
       return true;
     }
     break;
@@ -451,188 +586,29 @@ bool onTouch(const pl::input::TouchEvent &ev) {
   return false;
 }
 
-// ----------------------------------------- GameMode::buildBlock (tap/place)
+// ------------------------------------------- game hooks (server / client)
 Fn gBuildOrig = nullptr;
-std::atomic<bool> gWorldProbe{false};
-void probeGameMode(void *gm, const char *tag);
+Fn gGmDestroyOrig = nullptr;
+Fn gLpTickOrig = nullptr;
+GetBlockFn gGetBlock = nullptr;
+std::atomic<uintptr_t> gLocalPlayer{0};
 
+// Tap on a block: while SEL is armed the tap becomes a selection point.
 uintptr_t buildDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                       void *g, void *h) {
   if (gArmed.load(std::memory_order_relaxed)) {
     handleTap(b, c);
     return 0; // swallow the tap: no block placed
   }
-  if (gWorldProbe.load(std::memory_order_relaxed))
-    probeGameMode(a, "build");
   return gBuildOrig(a, b, c, d, e, f, g, h);
 }
 
-// ---------------------------------------- world probe E0/E1 (read-only)
-// Goal: find out whether a client and a server GameMode/BlockSource exist in
-// this process, on which threads, and whether getBlock agrees on both.
-constexpr uintptr_t kGmTickRva = 0xf8a38f0; // GameMode vtable slot 10
-constexpr const char *kGmTickHex = "fd7bbea9f30b00f9fd030091f30300aa";
-constexpr uintptr_t kGmDestroyRva = 0xf8a03ac; // GameMode vtable slot 3
-constexpr const char *kGmDestroyHex = "ff0302d1fd7b04a9f85f05a9f65706a9";
-constexpr uintptr_t kLpTickRva = 0xaac7dd8; // LocalPlayer vtable slot 25
-constexpr const char *kLpTickHex = "e80f19fcfd7b01a9fc6f02a9fa6703a9";
-constexpr uintptr_t kGetBlockRva = 0xfb91918; // BlockSource::getBlock (3rd party)
-constexpr uintptr_t kGmPlayerOff = 0x8;       // GameMode -> Player
-constexpr uintptr_t kActorDimOff = 448;       // Actor -> Dimension
-constexpr uintptr_t kDimBsOff = 208;          // Dimension -> BlockSource
-constexpr const char *kProbeId = "axiom.worldprobe";
-constexpr const char *kE4Id = "axiom.e4";
-constexpr const char *kE5Id = "axiom.e5";
-std::atomic<bool> gE4{false};
-std::atomic<bool> gE5{false};
-// BlockSource::setBlock = vtable slot 32 (offset 0x100) per the Levi devs
-constexpr uintptr_t kSetBlockRva = 0xfb9274c;
-constexpr const char *kSetBlockHex = "ff0302d1fd7b02a9fb1b00f9fa6704a9";
-constexpr int kSetBlockSlot = 32;
-Fn gSetBlockOrig = nullptr;
-
-// BlockSource::getBlock prologue (-1 = wildcard)
-constexpr int kGetBlockPat[] = {
-    -1, -1, -1, 0xD1, -1, -1, -1, 0xA9, -1, -1, -1, 0xA9, -1, -1, -1, 0xA9,
-    -1, -1, -1, 0x91, 0x56, 0xD0, 0x3B, 0xD5, -1, -1, -1, 0xF9, -1, -1, -1,
-    0xF9, -1, -1, -1, 0xB9, -1, -1, -1, 0x79, 0x1F, 0x01, 0x09, 0x6B};
-
-bool matchPattern(const void *p, const int *pat, size_t n) {
-  const unsigned char *b = static_cast<const unsigned char *>(p);
-  for (size_t i = 0; i < n; ++i)
-    if (pat[i] >= 0 && b[i] != pat[i])
-      return false;
-  return true;
-}
-
-using GetBlockFn = void *(*)(void *region, const int *pos);
-
-std::atomic<int> gWorldCount{0};
-std::atomic<uintptr_t> gLocalPlayer{0};
-GetBlockFn gGetBlock = nullptr;
-Fn gGmTickOrig = nullptr;
-Fn gGmDestroyOrig = nullptr;
-Fn gLpTickOrig = nullptr;
-
-long tid() { return syscall(SYS_gettid); }
-
-bool rdp(uintptr_t addr, uintptr_t &out) {
-  return addr > 0x10000 && safeRead(reinterpret_cast<void *>(addr), &out, 8);
-}
-
-uintptr_t vptrRva(uintptr_t obj) {
-  uintptr_t vp = 0;
-  if (!rdp(obj, vp) || vp < gBase)
-    return 0;
-  return vp - gBase;
-}
-
-void probeGameMode(void *gm, const char *tag) {
-  struct Seen {
-    uintptr_t gm;
-    int n;
-  };
-  static Seen seen[16];
-  static std::mutex mu;
-  int n;
-  {
-    std::lock_guard<std::mutex> lk(mu);
-    Seen *slot = nullptr;
-    for (auto &s : seen)
-      if (s.gm == reinterpret_cast<uintptr_t>(gm)) {
-        slot = &s;
-        break;
-      }
-    if (!slot)
-      for (auto &s : seen)
-        if (!s.gm) {
-          s.gm = reinterpret_cast<uintptr_t>(gm);
-          slot = &s;
-          break;
-        }
-    if (!slot)
-      return;
-    n = ++slot->n;
-  }
-  if (n > 3 || gWorldCount.load() > 80)
-    return;
-  uintptr_t player = 0, dim = 0, bs = 0;
-  rdp(reinterpret_cast<uintptr_t>(gm) + kGmPlayerOff, player);
-  if (player)
-    rdp(player + kActorDimOff, dim);
-  if (dim)
-    rdp(dim + kDimBsOff, bs);
-  void *gb = nullptr;
-  uintptr_t gbVp = 0;
-  bool have;
-  int pos[3];
-  {
-    std::lock_guard<std::mutex> lk(gSelMu);
-    have = gHave[0];
-    std::memcpy(pos, gPos[0], sizeof(pos));
-  }
-  if (gGetBlock && bs && have) {
-    gb = gGetBlock(reinterpret_cast<void *>(bs), pos);
-    if (gb)
-      gbVp = vptrRva(reinterpret_cast<uintptr_t>(gb));
-  }
-  char buf[420];
-  snprintf(buf, sizeof(buf),
-           "E0 %s #%d gm=%p tid=%ld player=%p local=%d plVp=0x%lx dim=%p bs=%p "
-           "bsVp=0x%lx pos1=%d,%d,%d getBlock=%p blkVp=0x%lx",
-           tag, n, gm, tid(), reinterpret_cast<void *>(player),
-           player && player == gLocalPlayer.load() ? 1 : 0,
-           static_cast<unsigned long>(vptrRva(player)),
-           reinterpret_cast<void *>(dim), reinterpret_cast<void *>(bs),
-           static_cast<unsigned long>(vptrRva(bs)), have ? pos[0] : 0,
-           have ? pos[1] : 0, have ? pos[2] : 0, gb,
-           static_cast<unsigned long>(gbVp));
-  gWorldCount.fetch_add(1);
-  logLine(buf);
-}
-
-uintptr_t gmTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+uintptr_t lpTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
                        void *g, void *h) {
-  if (gWorldProbe.load(std::memory_order_relaxed))
-    probeGameMode(a, "tick");
-  return gGmTickOrig(a, b, c, d, e, f, g, h);
+  gLocalPlayer.store(reinterpret_cast<uintptr_t>(a), std::memory_order_relaxed);
+  return gLpTickOrig(a, b, c, d, e, f, g, h);
 }
 
-thread_local bool tInRemote = false;
-bool tInRemoteFlag() { return tInRemote; }
-
-uintptr_t setBlockLogDetour(void *a, void *b, void *c, void *d, void *e,
-                            void *f, void *g, void *h) {
-  static std::atomic<int> cnt{0};
-  static std::atomic<uint64_t> last{0};
-  if (gWorldProbe.load(std::memory_order_relaxed) && !tInRemoteFlag() &&
-      cnt.load() < 150) {
-    int pos[3] = {0, 0, 0};
-    const bool ok = safeRead(b, pos, sizeof(pos));
-    uintptr_t cv = 0;
-    rdp(reinterpret_cast<uintptr_t>(c), cv);
-    const int flags = static_cast<int>(reinterpret_cast<uintptr_t>(d));
-    const uint64_t key =
-        (static_cast<uint64_t>(static_cast<uint32_t>(pos[0])) * 73856093ull) ^
-        (static_cast<uint64_t>(static_cast<uint32_t>(pos[1])) * 19349663ull) ^
-        (static_cast<uint64_t>(static_cast<uint32_t>(pos[2])) * 83492791ull) ^
-        (reinterpret_cast<uintptr_t>(c) >> 4) ^ flags;
-    if (last.exchange(key) != key) {
-      char buf[300];
-      snprintf(buf, sizeof(buf),
-               "SB #%d bs=%p tid=%ld pos=(%d,%d,%d)%s block=%p blkVp=0x%lx "
-               "flags=%d sync=%p ctx=%p",
-               cnt.fetch_add(1), a, tid(), pos[0], pos[1], pos[2],
-               ok ? "" : "?", c,
-               static_cast<unsigned long>(cv ? cv - gBase : 0), flags, e, f);
-      logLine(buf);
-    }
-  }
-  return gSetBlockOrig(a, b, c, d, e, f, g, h);
-}
-
-
-// Reads the BlockSource of the player that owns this GameMode.
 uintptr_t blockSourceOf(void *gm) {
   uintptr_t player = 0, dim = 0, bs = 0;
   rdp(reinterpret_cast<uintptr_t>(gm) + kGmPlayerOff, player);
@@ -643,163 +619,70 @@ uintptr_t blockSourceOf(void *gm) {
   return bs;
 }
 
-uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
-                          void *g, void *h) {
-  if (gWorldProbe.load(std::memory_order_relaxed))
-    probeGameMode(a, "destroy");
-  const uintptr_t r = gGmDestroyOrig(a, b, c, d, e, f, g, h);
-
-  // E4 (one shot): when the SERVER GameMode finishes a destroyBlock, call the
-  // same function again for Pos1 (can be far from the player) and report.
-  if (!tInRemote && gE4.load(std::memory_order_relaxed) && gGetBlock) {
-    uintptr_t player = 0;
-    rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, player);
-    if (player && player != gLocalPlayer.load()) {
-      int target[3], broken[3] = {0, 0, 0};
-      bool have;
-      {
-        std::lock_guard<std::mutex> lk(gSelMu);
-        have = gHave[0];
-        std::memcpy(target, gPos[0], sizeof(target));
-      }
-      safeRead(b, broken, sizeof(broken));
-      const uintptr_t bs = blockSourceOf(a);
-      if (have && bs &&
-          (target[0] != broken[0] || target[1] != broken[1] ||
-           target[2] != broken[2])) {
-        gE4.store(false);
-        tInRemote = true;
-        void *before = gGetBlock(reinterpret_cast<void *>(bs), target);
-        const uintptr_t rr = gGmDestroyOrig(a, target, c, d, e, f, g, h);
-        void *after = gGetBlock(reinterpret_cast<void *>(bs), target);
-        tInRemote = false;
-        char buf[300];
-        snprintf(buf, sizeof(buf),
-                 "E4 remote destroy tid=%ld broken=(%d,%d,%d) target=(%d,%d,%d) "
-                 "dx=%d dy=%d dz=%d ret=%lu before=%p after=%p changed=%d",
-                 tid(), broken[0], broken[1], broken[2], target[0], target[1],
-                 target[2], target[0] - broken[0], target[1] - broken[1],
-                 target[2] - broken[2], static_cast<unsigned long>(rr), before,
-                 after, before != after ? 1 : 0);
-        logLine(buf);
-      } else {
-        logLine("E4 skipped: need Pos1 different from the broken block");
-      }
+// Runs on the SERVER thread (inside the server GameMode::destroyBlock hook).
+void runDelSlice(void *gm, void *face) {
+  const uintptr_t bs = blockSourceOf(gm);
+  if (!bs || !gGetBlock)
+    return;
+  void *B = reinterpret_cast<void *>(bs);
+  std::lock_guard<std::mutex> lk(gDelMu);
+  if (!gDelActive.load())
+    return;
+  if (!gDelAir) {
+    int top[3] = {gDelCur[0], 319, gDelCur[2]};
+    gDelAir = gGetBlock(B, top);
+    if (!gDelAir) {
+      gDelMsg = "DEL: could not read the world";
+      gDelActive.store(false);
+      gHudDirty.store(true);
+      return;
     }
   }
-
-  // E5b (one shot): call BlockSource::setBlock (vtable slot 32) on the SERVER
-  // BlockSource. Source = first solid block at/below Pos2 (or Pos1); target =
-  // first AIR cell at/above Pos1. Tries a few argument variants, reads back
-  // immediately and again 300 ms later.
-  if (!tInRemote && gE5.load(std::memory_order_relaxed) && gGetBlock) {
-    uintptr_t player = 0;
-    rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, player);
-    if (player && player != gLocalPlayer.load()) {
-      int p1[3], p2[3];
-      bool have1, have2;
-      {
-        std::lock_guard<std::mutex> lk(gSelMu);
-        have1 = gHave[0];
-        have2 = gHave[1];
-        std::memcpy(p1, gPos[0], sizeof(p1));
-        std::memcpy(p2, gPos[1], sizeof(p2));
-      }
-      const uintptr_t bs = blockSourceOf(a);
-      uintptr_t vt = 0, fnAddr = 0;
-      if (bs)
-        rdp(bs, vt);
-      if (vt)
-        rdp(vt + 8 * kSetBlockSlot, fnAddr);
-      if (have1 && bs && fnAddr) {
-        gE5.store(false);
-        void *B = reinterpret_cast<void *>(bs);
-        int top[3] = {p1[0], 319, p1[2]};
-        void *air = gGetBlock(B, top);
-        auto firstSolid = [&](const int *p) -> void * {
-          for (int dy = 0; dy >= -3; --dy) {
-            int q[3] = {p[0], p[1] + dy, p[2]};
-            void *blk = gGetBlock(B, q);
-            if (blk && blk != air)
-              return blk;
-          }
-          return nullptr;
-        };
-        void *src = have2 ? firstSolid(p2) : nullptr;
-        if (!src)
-          src = firstSolid(p1);
-        int tgt[3] = {0, 0, 0};
-        bool found = false;
-        for (int dy = 0; dy <= 8 && !found; ++dy) {
-          int q[3] = {p1[0], p1[1] + dy, p1[2]};
-          if (gGetBlock(B, q) == air) {
-            std::memcpy(tgt, q, sizeof(tgt));
-            found = true;
-          }
+  const long long t0 = nowMs();
+  unsigned n = 0;
+  while (gDelActive.load()) {
+    int pos[3] = {gDelCur[0], gDelCur[1], gDelCur[2]};
+    void *blk = gGetBlock(B, pos);
+    if (blk && blk != gDelAir) {
+      gGmDestroyOrig(gm, pos, face, nullptr, nullptr, nullptr, nullptr,
+                     nullptr);
+      ++gDelRemoved;
+    }
+    ++gDelDone;
+    // advance: x, then z, then y downwards
+    if (++gDelCur[0] > gDelMax[0]) {
+      gDelCur[0] = gDelMin[0];
+      if (++gDelCur[2] > gDelMax[2]) {
+        gDelCur[2] = gDelMin[2];
+        if (--gDelCur[1] < gDelMin[1]) {
+          gDelActive.store(false);
+          char buf[80];
+          snprintf(buf, sizeof(buf), "DEL done: %lld blocks removed",
+                   gDelRemoved);
+          gDelMsg = buf;
+          logLine(buf);
+          break;
         }
-        char buf[420];
-        snprintf(buf, sizeof(buf),
-                 "E5b setup tid=%ld air=%p src=%p target=(%d,%d,%d) found=%d "
-                 "fn=0x%lx",
-                 tid(), air, src, tgt[0], tgt[1], tgt[2], found ? 1 : 0,
-                 static_cast<unsigned long>(fnAddr - gBase));
-        logLine(buf);
-        if (src && found) {
-          struct Variant {
-            int flags;
-            int ctxMode;
-          };
-          const Variant variants[] = {{3, 0}, {2, 0}, {0, 0}, {3, 1}};
-          using SetFn = uintptr_t (*)(void *, const int *, void *, int, void *,
-                                      void *);
-          bool done = false;
-          for (int i = 0; i < 4 && !done; ++i) {
-            alignas(16) unsigned char ctx[256];
-            std::memset(ctx, 0, sizeof(ctx));
-            if (variants[i].ctxMode == 1)
-              std::memcpy(ctx, &player, sizeof(player));
-            tInRemote = true;
-            const uintptr_t rr = reinterpret_cast<SetFn>(fnAddr)(
-                B, tgt, src, variants[i].flags, nullptr, ctx);
-            tInRemote = false;
-            void *after = gGetBlock(B, tgt);
-            snprintf(buf, sizeof(buf),
-                     "E5b try%d flags=%d ctxMode=%d ret=%lu after=%p "
-                     "isSrc=%d isAir=%d",
-                     i, variants[i].flags, variants[i].ctxMode,
-                     static_cast<unsigned long>(rr), after,
-                     after == src ? 1 : 0, after == air ? 1 : 0);
-            logLine(buf);
-            done = (after == src);
-          }
-          const uintptr_t cpy[3] = {bs, reinterpret_cast<uintptr_t>(src),
-                                    reinterpret_cast<uintptr_t>(air)};
-          const int t0 = tgt[0], t1 = tgt[1], t2 = tgt[2];
-          GetBlockFn gb = gGetBlock;
-          std::thread([cpy, t0, t1, t2, gb] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            int q[3] = {t0, t1, t2};
-            void *later = gb(reinterpret_cast<void *>(cpy[0]), q);
-            char b2[200];
-            snprintf(b2, sizeof(b2),
-                     "E5b delayed(300ms) later=%p isSrc=%d isAir=%d", later,
-                     reinterpret_cast<uintptr_t>(later) == cpy[1] ? 1 : 0,
-                     reinterpret_cast<uintptr_t>(later) == cpy[2] ? 1 : 0);
-            logLine(b2);
-          }).detach();
-        }
-      } else {
-        logLine("E5b skipped: need Pos1");
       }
     }
+    if ((++n & 63u) == 0 && nowMs() - t0 > kBudgetMs) {
+      gDelMsg = "DEL paused: break a block to continue";
+      break;
+    }
   }
-  return r;
+  gHudDirty.store(true);
 }
 
-uintptr_t lpTickDetour(void *a, void *b, void *c, void *d, void *e, void *f,
-                       void *g, void *h) {
-  gLocalPlayer.store(reinterpret_cast<uintptr_t>(a), std::memory_order_relaxed);
-  return gLpTickOrig(a, b, c, d, e, f, g, h);
+uintptr_t gmDestroyDetour(void *a, void *b, void *c, void *d, void *e, void *f,
+                          void *g, void *h) {
+  const uintptr_t r = gGmDestroyOrig(a, b, c, d, e, f, g, h);
+  if (gDelActive.load(std::memory_order_relaxed)) {
+    uintptr_t player = 0;
+    rdp(reinterpret_cast<uintptr_t>(a) + kGmPlayerOff, player);
+    if (player && player != gLocalPlayer.load()) // server GameMode only
+      runDelSlice(a, c);
+  }
+  return r;
 }
 
 void onToggle(std::string_view id, bool enabled) {
@@ -807,16 +690,12 @@ void onToggle(std::string_view id, bool enabled) {
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(enabled);
     saveState(enabled);
-  } else if (id == kE4Id) {
-    gE4.store(enabled);
-  } else if (id == kE5Id) {
-    gE5.store(enabled);
-  } else if (id == kProbeId) {
-    gWorldProbe.store(enabled);
   } else if (id == kToolsId) {
     gToolsOn.store(enabled);
-    if (!enabled)
+    if (!enabled) {
       gArmed.store(false);
+      gDelActive.store(false);
+    }
     gHudDirty.store(true);
   }
 }
@@ -841,6 +720,7 @@ public:
       log.info("libminecraftpe.so not found");
       return false;
     }
+    gBase = base;
     {
       const char *cands[] = {"/sdcard/Download/axiom_log3.txt",
                              "/sdcard/axiom_log3.txt"};
@@ -857,9 +737,8 @@ public:
         gLogPath = d.empty() ? "/dev/null" : d + "axiom_log3.txt";
       }
     }
-    logLine("--- axiom v0.3 start --- path=" + gLogPath);
+    logLine("--- axiom v1.0 start --- path=" + gLogPath);
 
-    gBase = base;
     const bool savedOn = loadState();
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(savedOn);
@@ -886,22 +765,37 @@ public:
     if (ok == 0)
       return false;
 
-    // ---- tap hook
-    {
-      auto *addr = reinterpret_cast<void *>(base + kBuildRva);
-      if (matchHex(addr, kBuildHex)) {
-        mBuildHook = pl::memory::HookHandle(
-            addr, reinterpret_cast<void *>(&buildDetour),
-            reinterpret_cast<void **>(&gBuildOrig),
-            pl::memory::HookPriority::Normal);
-      }
-      mTapOk = mBuildHook.installed();
-    }
+    // ---- game hooks (tap, destroy, local player) + getBlock
+    auto install = [&](uintptr_t rva, const char *hex, void *detourFn, Fn *orig,
+                       pl::memory::HookHandle &h) {
+      auto *addr = reinterpret_cast<void *>(base + rva);
+      if (!matchHex(addr, hex))
+        return false;
+      h = pl::memory::HookHandle(addr, detourFn,
+                                 reinterpret_cast<void **>(orig),
+                                 pl::memory::HookPriority::Normal);
+      return h.installed();
+    };
+    const bool tapOk = install(kBuildRva, kBuildHex,
+                               reinterpret_cast<void *>(&buildDetour),
+                               &gBuildOrig, mBuildHook);
+    const bool delOk = install(kGmDestroyRva, kGmDestroyHex,
+                               reinterpret_cast<void *>(&gmDestroyDetour),
+                               &gGmDestroyOrig, mGmDestroyHook);
+    const bool lpOk = install(kLpTickRva, kLpTickHex,
+                              reinterpret_cast<void *>(&lpTickDetour),
+                              &gLpTickOrig, mLpTickHook);
+    auto *gbAddr = reinterpret_cast<void *>(base + kGetBlockRva);
+    const bool gbOk =
+        matchPattern(gbAddr, kGetBlockPat, sizeof(kGetBlockPat) / sizeof(int));
+    gGetBlock = gbOk ? reinterpret_cast<GetBlockFn>(gbAddr) : nullptr;
     logLine("hooks: noupdates=" + std::to_string(ok) +
-            " tapHook=" + std::string(mTapOk ? "yes" : "no"));
+            " tap=" + std::to_string(tapOk) + " destroy=" +
+            std::to_string(delOk) + " localPlayer=" + std::to_string(lpOk) +
+            " getBlock=" + std::to_string(gbOk));
+    mTapOk = tapOk;
 
     // ---- menu
-    logLine("step: registering No Updates");
     bool r = pl::modmenu::ModuleBuilder(kModuleId, "No Updates")
                  .modId(mSelf.getId())
                  .description("Freezes block updates: sand, gravel, water, "
@@ -911,24 +805,21 @@ public:
                  .registerModule();
     logLine("step: No Updates done");
 
-    if (mTapOk) {
-      logLine("step: registering Axiom Tools");
+    if (tapOk) {
       r &= pl::modmenu::ModuleBuilder(kToolsId, "Axiom Tools")
                .modId(mSelf.getId())
-               .description("HUD button SEL: tap it, then tap two blocks "
-                            "(Pos1, Pos2).")
+               .description("SEL: tap it, then tap two blocks (Pos1, Pos2). "
+                            "DEL: removes the selection (needs a creative "
+                            "world; break a block to run it).")
                .defaultEnabled(true)
                .onToggle(onToggle)
                .registerModule();
       logLine("step: Axiom Tools done");
 
       findJni();
-      logLine(std::string("hud size fn: ") + (gSizeFn ? "found" : "MISSING") +
-              ", hud fn: " + (gHudFn ? "found" : "missing"));
       if (!gTouchRegistered.exchange(true)) {
         pl::input::registerTouchCallback(
             [](const pl::input::TouchEvent &ev) { return onTouch(ev); });
-        logLine("step: touch callback registered");
       }
       gStop.store(false);
       gToolsOn.store(true);
@@ -937,68 +828,6 @@ public:
       gHudDirty.store(true);
       logLine("step: HUD loop started");
     }
-
-    // ---- world probe hooks + module (read-only test)
-    {
-      auto install = [&](uintptr_t rva, const char *hex, void *detour, Fn *orig,
-                         pl::memory::HookHandle &h) {
-        auto *addr = reinterpret_cast<void *>(base + rva);
-        if (!matchHex(addr, hex))
-          return false;
-        h = pl::memory::HookHandle(addr, detour,
-                                   reinterpret_cast<void **>(orig),
-                                   pl::memory::HookPriority::Normal);
-        return h.installed();
-      };
-      const bool t1 = install(kGmTickRva, kGmTickHex,
-                              reinterpret_cast<void *>(&gmTickDetour),
-                              &gGmTickOrig, mGmTickHook);
-      const bool t2 = install(kGmDestroyRva, kGmDestroyHex,
-                              reinterpret_cast<void *>(&gmDestroyDetour),
-                              &gGmDestroyOrig, mGmDestroyHook);
-      const bool t3 = install(kLpTickRva, kLpTickHex,
-                              reinterpret_cast<void *>(&lpTickDetour),
-                              &gLpTickOrig, mLpTickHook);
-      const bool t5 = install(kSetBlockRva, kSetBlockHex,
-                              reinterpret_cast<void *>(&setBlockLogDetour),
-                              &gSetBlockOrig, mSetBlockHook);
-      logLine("setBlock slot32 hook=" + std::to_string(t5));
-      auto *gbAddr = reinterpret_cast<void *>(base + kGetBlockRva);
-      const bool gbOk = matchPattern(gbAddr, kGetBlockPat,
-                                     sizeof(kGetBlockPat) / sizeof(int));
-      gGetBlock = gbOk ? reinterpret_cast<GetBlockFn>(gbAddr) : nullptr;
-      logLine("world probe hooks: gmTick=" + std::to_string(t1) +
-              " gmDestroy=" + std::to_string(t2) +
-              " lpTick=" + std::to_string(t3) +
-              " getBlockSig=" + std::to_string(gbOk));
-      if (t1) {
-        logLine("step: registering World Probe");
-        r &= pl::modmenu::ModuleBuilder(kProbeId, "World Probe (test)")
-                 .modId(mSelf.getId())
-                 .description("Test (read-only): turn on, tap a block with "
-                              "SEL (Pos1), walk and break one block, turn off.")
-                 .defaultEnabled(false)
-                 .onToggle(onToggle)
-                 .registerModule();
-        logLine("step: World Probe done");
-        r &= pl::modmenu::ModuleBuilder(kE4Id, "Remote Destroy (test)")
-                 .modId(mSelf.getId())
-                 .description("One-shot test: set Pos1 on a far block, turn "
-                              "on, then break any block next to you.")
-                 .defaultEnabled(false)
-                 .onToggle(onToggle)
-                 .registerModule();
-        logLine("step: Remote Destroy done");
-        r &= pl::modmenu::ModuleBuilder(kE5Id, "Remote Set (test)")
-                 .modId(mSelf.getId())
-                 .description("One-shot: set Pos1 (far) and Pos2 (block to "
-                              "copy), turn on, break any block nearby.")
-                 .defaultEnabled(false)
-                 .onToggle(onToggle)
-                 .registerModule();
-        logLine("step: Remote Set done");
-      }
-    }
     return r;
   }
 
@@ -1006,21 +835,14 @@ public:
     for (int i = 0; i < 3; ++i)
       gFrozen[i].store(false);
     gArmed.store(false);
+    gDelActive.store(false);
     gToolsOn.store(false);
     gStop.store(true);
-    gWorldProbe.store(false);
-    gE4.store(false);
-    gE5.store(false);
-    pl::modmenu::unregisterModule(kE5Id);
-    pl::modmenu::unregisterModule(kE4Id);
-    pl::modmenu::unregisterModule(kProbeId);
     pl::modmenu::unregisterModule(kToolsId);
     pl::modmenu::unregisterModule(kModuleId);
-    mBuildHook.reset();
-    mGmTickHook.reset();
     mGmDestroyHook.reset();
     mLpTickHook.reset();
-    mSetBlockHook.reset();
+    mBuildHook.reset();
     for (auto &h : mHooks)
       h.reset();
     return true;
@@ -1033,10 +855,8 @@ private:
   bool mTapOk = false;
   std::array<pl::memory::HookHandle, kCount> mHooks;
   pl::memory::HookHandle mBuildHook;
-  pl::memory::HookHandle mGmTickHook;
   pl::memory::HookHandle mGmDestroyHook;
   pl::memory::HookHandle mLpTickHook;
-  pl::memory::HookHandle mSetBlockHook;
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
