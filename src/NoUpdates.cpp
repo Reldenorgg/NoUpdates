@@ -280,19 +280,14 @@ bool gameHudVisible() {
          !gPauseFn(nullptr, nullptr);
 }
 
-// buildBlock receives the cell where a block would be placed; the clicked
-// block is that cell minus the face normal (0=-y 1=+y 2=-z 3=+z 4=-x 5=+x).
+// buildBlock(pos, face): pos is the CLICKED block (the new block would go on
+// the neighbouring cell given by face). The selection uses the clicked block.
 void handleTap(void *posPtr, void *faceArg) {
   int pos[3];
   if (!safeRead(posPtr, pos, sizeof(pos)))
     return;
   const unsigned face =
       static_cast<unsigned>(reinterpret_cast<uintptr_t>(faceArg) & 0xff);
-  static const int nrm[6][3] = {{0, -1, 0}, {0, 1, 0}, {0, 0, -1},
-                                {0, 0, 1},  {-1, 0, 0}, {1, 0, 0}};
-  if (face < 6)
-    for (int i = 0; i < 3; ++i)
-      pos[i] -= nrm[face][i];
   int idx;
   {
     std::lock_guard<std::mutex> lk(gSelMu);
