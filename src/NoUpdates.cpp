@@ -1,4 +1,5 @@
-// Axiom for Levi v1.0 - Minecraft Bedrock 26.52.3 (arm64)
+```cpp
+// Axiom for Levi v1.1 - Minecraft Bedrock 26.52.3 (arm64)
 //  * No Updates : freezes block events (physics, redstone, ticks)
 //  * SEL        : HUD button; next two block taps set Pos1 / Pos2
 //  * DEL        : HUD button; removes every block of the selection through
@@ -349,7 +350,7 @@ void toggleArmed() {
 
 // ------------------------------------------------------------- DEL / FILL job
 constexpr long long kMaxCells = 4000000; // refuse bigger boxes
-constexpr long long kBudgetMs = 250;     // server-thread time per trigger
+constexpr long long kBudgetMs = 350;     // server-thread time per trigger
 enum JobMode { kNone = 0, kDel = 1, kFill = 2 };
 
 std::mutex gDelMu;
@@ -360,6 +361,7 @@ long long gDelTotal = 0, gDelDone = 0, gDelRemoved = 0, gDelFailed = 0;
 void *gDelAir = nullptr;
 std::string gDelMsg;
 bool gFillOk = false; // helper functions resolved
+long long gFillStackBudget = 0; // blocks left in hand (soft counter)
 
 HandItemFn gHandItem = nullptr;
 ItemBlockTypeFn gItemBlockType = nullptr;
@@ -433,6 +435,7 @@ void startOrCancelJob(int mode) {
   gDelTotal = vol;
   gDelDone = gDelRemoved = gDelFailed = 0;
   gDelAir = nullptr;
+  gFillStackBudget = 0;
   gJobMode = mode;
   gDelMsg = (mode == kDel)
                 ? "DEL ready: break any block to run"
@@ -756,6 +759,8 @@ void runJobSlice(void *gm, void *face) {
       return;
     }
     useOn = reinterpret_cast<UseItemOnFn>(fn);
+    // Refresh the soft budget of blocks in hand
+    gFillStackBudget = 64;
   }
 
   struct Nb {
@@ -763,81 +768,153 @@ void runJobSlice(void *gm, void *face) {
     unsigned char face;
     float nx, ny, nz; // normal of the clicked face (points to the target)
   };
-  static const Nb nbs[6] = {{0, -1, 0, 1, 0, 1, 0},  {-1, 0, 0, 5, 1, 0, 0},
-                            {1, 0, 0, 4, -1, 0, 0},  {0, 0, -1, 3, 0, 0, 1},
-                            {0, 0, 1, 2, 0, 0, -1},  {0, 1, 0, 0, 0, -1, 0}};
+  // Priority order: top support first, then sides, then bottom.
+  static const Nb nbs[6] = {
+      {0, -1, 0, 1, 0, 1, 0},  // support below, click top face
+      {-1, 0, 0, 5, 1, 0, 0},  // support west,  click east face
+      {1, 0, 0, 4, -1, 0, 0},  // support east,  click west face
+      {0, 0, -1, 3, 0, 0, 1},  // support north, click south face
+      {0, 0, 1, 2, 0, 0, -1},  // support south, click north face
+      {0, 1, 0, 0, 0, -1, 0}   // support above, click bottom face
+  };
 
   const long long t0 = nowMs();
   unsigned n = 0;
   long long consecutiveFail = 0;
+  long long failLogged = 0;
   while (gDelActive.load()) {
     int pos[3] = {gDelCur[0], gDelCur[1], gDelCur[2]};
     void *cur = gGetBlock(B, pos);
+
+    // Advance helper (kept inline so we can `continue` cleanly)
+    auto advance = [&]() -> bool {
+      if (++gDelCur[0] > gDelMax[0]) {
+        gDelCur[0] = gDelMin[0];
+        if (++gDelCur[2] > gDelMax[2]) {
+          gDelCur[2] = gDelMin[2];
+          if (gJobMode == kDel)
+            return --gDelCur[1] >= gDelMin[1];
+          return ++gDelCur[1] <= gDelMax[1];
+        }
+      }
+      return true;
+    };
+
     if (gJobMode == kDel) {
       if (cur && cur != gDelAir) {
         gGmDestroyOrig(gm, pos, face, nullptr, nullptr, nullptr, nullptr,
                        nullptr);
         ++gDelRemoved;
       }
-    } else if (cur == gDelAir) { // FILL: only empty cells
-      bool placed = false, hadSupport = false;
+      ++gDelDone;
+    } else {
+      // FILL: only empty cells
+      if (cur != gDelAir) {
+        ++gDelDone;
+        if (!advance()) {
+          gDelActive.store(false);
+          char buf[96];
+          snprintf(buf, sizeof(buf), "FILL done: %lld blocks placed",
+                   gDelRemoved);
+          gDelMsg = buf;
+          logLine(buf);
+          break;
+        }
+        continue;
+      }
+      // 1) Fast pre-check: does any neighbour have a block?
+      void *supportCb = nullptr;
+      const Nb *supportNb = nullptr;
       for (const Nb &nb : nbs) {
         int c[3] = {pos[0] + nb.dx, pos[1] + nb.dy, pos[2] + nb.dz};
         void *cb = gGetBlock(B, c);
-        if (!cb || cb == gDelAir)
-          continue;
-        hadSupport = true;
-        const float hit[3] = {c[0] + 0.5f + 0.5f * nb.nx,
-                              c[1] + 0.5f + 0.5f * nb.ny,
-                              c[2] + 0.5f + 0.5f * nb.nz};
-        useOn(gm, const_cast<void *>(stack), c, nb.face, hit, cb);
+        if (cb && cb != gDelAir) {
+          supportCb = cb;
+          supportNb = &nb;
+          break;
+        }
+      }
+      bool placed = false;
+      if (supportCb) {
+        // 2) Try only the found support first (fast path)
+        const int c0[3] = {pos[0] + supportNb->dx, pos[1] + supportNb->dy,
+                           pos[2] + supportNb->dz};
+        const float hit0[3] = {c0[0] + 0.5f + 0.5f * supportNb->nx,
+                               c0[1] + 0.5f + 0.5f * supportNb->ny,
+                               c0[2] + 0.5f + 0.5f * supportNb->nz};
+        useOn(gm, const_cast<void *>(stack), c0, supportNb->face, hit0,
+              supportCb);
         if (gGetBlock(B, pos) != gDelAir) {
           placed = true;
-          break;
+        } else {
+          // 3) Fallback: try the other neighbours
+          for (const Nb &nb : nbs) {
+            if (&nb == supportNb)
+              continue;
+            int c[3] = {pos[0] + nb.dx, pos[1] + nb.dy, pos[2] + nb.dz};
+            void *cb = gGetBlock(B, c);
+            if (!cb || cb == gDelAir)
+              continue;
+            const float hit[3] = {c[0] + 0.5f + 0.5f * nb.nx,
+                                  c[1] + 0.5f + 0.5f * nb.ny,
+                                  c[2] + 0.5f + 0.5f * nb.nz};
+            useOn(gm, const_cast<void *>(stack), c, nb.face, hit, cb);
+            if (gGetBlock(B, pos) != gDelAir) {
+              placed = true;
+              break;
+            }
+          }
         }
       }
       if (placed) {
         ++gDelRemoved;
         consecutiveFail = 0;
+        if (--gFillStackBudget <= 0) {
+          // Re-read the actual hand to see if we truly ran out
+          rdp(reinterpret_cast<uintptr_t>(gm) + kGmPlayerOff, player);
+          stack = (player && gHandItem)
+                      ? gHandItem(reinterpret_cast<void *>(player), 0)
+                      : nullptr;
+          if (!isBlockItem(stack)) {
+            gDelMsg = "FILL paused: out of blocks";
+            gHudDirty.store(true);
+            ++gDelDone;
+            break;
+          }
+          gFillStackBudget = 64;
+        }
       } else {
         ++gDelFailed;
         ++consecutiveFail;
-        (void)hadSupport;
+        if (failLogged < 10) {
+          char buf[128];
+          snprintf(buf, sizeof(buf), "FILL skipped (%d,%d,%d)", pos[0],
+                   pos[1], pos[2]);
+          logLine(buf);
+          ++failLogged;
+        }
         if (gDelRemoved == 0 && consecutiveFail >= 30) {
           gDelMsg = "FILL: the game refused to place (need a solid neighbour)";
           logLine(gDelMsg);
           gDelActive.store(false);
+          gHudDirty.store(true);
           break;
         }
       }
-      if ((n & 63u) == 63u && stackEmpty(stack)) {
-        gDelMsg = "FILL paused: out of blocks";
-        break;
-      }
+      ++gDelDone;
     }
-    ++gDelDone;
-    // advance: x, then z, then y (DEL downwards, FILL upwards)
-    if (++gDelCur[0] > gDelMax[0]) {
-      gDelCur[0] = gDelMin[0];
-      if (++gDelCur[2] > gDelMax[2]) {
-        gDelCur[2] = gDelMin[2];
-        bool finished;
-        if (gJobMode == kDel)
-          finished = --gDelCur[1] < gDelMin[1];
-        else
-          finished = ++gDelCur[1] > gDelMax[1];
-        if (finished) {
-          gDelActive.store(false);
-          char buf[96];
-          snprintf(buf, sizeof(buf), "%s done: %lld %s",
-                   gJobMode == kDel ? "DEL" : "FILL", gDelRemoved,
-                   gJobMode == kDel ? "blocks removed" : "blocks placed");
-          gDelMsg = buf;
-          logLine(buf);
-          break;
-        }
-      }
+
+    if (!advance()) {
+      gDelActive.store(false);
+      char buf[96];
+      snprintf(buf, sizeof(buf), "%s done: %lld %s",
+               gJobMode == kDel ? "DEL" : "FILL", gDelRemoved,
+               gJobMode == kDel ? "blocks removed" : "blocks placed");
+      gDelMsg = buf;
+      logLine(buf);
+      break;
     }
+
     if ((++n & 31u) == 0 && nowMs() - t0 > kBudgetMs) {
       gDelMsg = "Paused: break a block to continue";
       break;
@@ -1048,3 +1125,4 @@ private:
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
+```
