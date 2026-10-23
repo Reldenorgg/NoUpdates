@@ -1,4 +1,3 @@
-```cpp
 // Axiom for Levi v1.1 - Minecraft Bedrock 26.52.3 (arm64)
 //  * No Updates : freezes block events (physics, redstone, ticks)
 //  * SEL        : HUD button; next two block taps set Pos1 / Pos2
@@ -1125,4 +1124,3 @@ private:
 };
 
 PL_REGISTER_MOD(NoUpdatesMod, NoUpdatesMod::instance())
-```
